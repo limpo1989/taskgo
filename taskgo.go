@@ -18,7 +18,6 @@ package taskgo
 
 import (
 	"context"
-	"sync/atomic"
 	"time"
 )
 
@@ -29,13 +28,10 @@ type TaskExecutor[T any] interface {
 
 func NewTaskExecutor[T any](parent context.Context, concurrency int32, executor func(ctx context.Context, task T)) TaskExecutor[T] {
 	ctx, cancel := context.WithCancel(parent)
-	token := make(chan struct{}, 1)
-	token <- struct{}{}
 	return &taskExecutor[T]{
 		ctx:      ctx,
 		cancel:   cancel,
-		token:    token,
-		window:   concurrency,
+		token:    make(chan struct{}, concurrency),
 		executor: executor,
 	}
 }
@@ -51,21 +47,12 @@ type taskExecutor[T any] struct {
 	ctx      context.Context
 	cancel   context.CancelFunc
 	token    chan struct{}
-	window   int32
 	executor func(ctx context.Context, task T)
 }
 
 func (te *taskExecutor[T]) Exec(task T) {
-	// get token
-	<-te.token
-
-	// execute task in new goroutine
+	te.token <- struct{}{}
 	go te.execTask(task)
-
-	// flush token
-	if wnd := atomic.AddInt32(&te.window, -1); wnd > 0 {
-		te.token <- struct{}{}
-	}
 }
 
 func (te *taskExecutor[T]) Cancel(timeout time.Duration) {
@@ -74,11 +61,6 @@ func (te *taskExecutor[T]) Cancel(timeout time.Duration) {
 }
 
 func (te *taskExecutor[T]) execTask(task T) {
-	defer func() {
-		if wnd := atomic.AddInt32(&te.window, 1); 1 == wnd {
-			te.token <- struct{}{}
-		}
-	}()
-
+	defer func() { <-te.token }()
 	te.executor(te.ctx, task)
 }
