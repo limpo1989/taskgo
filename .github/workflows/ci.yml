@@ -29,8 +29,11 @@ jobs:
           check-latest: true
 
       - name: Verify formatting
-        # Pin to bash so this step behaves identically on the Windows runner,
-        # whose default shell is PowerShell.
+        # Formatting is platform-independent, so check it once on Linux only.
+        # The Windows runner checks out files with CRLF line endings, which makes
+        # gofmt -l flag every file (it would rewrite CRLF to LF); skipping it
+        # there avoids a false positive.
+        if: matrix.os == 'ubuntu-latest'
         shell: bash
         run: |
           unformatted=$(gofmt -l .)
