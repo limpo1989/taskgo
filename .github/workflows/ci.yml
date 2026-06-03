@@ -1,0 +1,71 @@
+name: CI
+
+on:
+  push:
+    branches: [ "**" ]
+  pull_request:
+    branches: [ "**" ]
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    name: test (go ${{ matrix.go }} / ${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        go: [ "1.24", "1.25", "1.26" ]
+        os: [ ubuntu-latest, windows-latest, macos-latest ]
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: ${{ matrix.go }}
+          check-latest: true
+
+      - name: Verify formatting
+        # Pin to bash so this step behaves identically on the Windows runner,
+        # whose default shell is PowerShell.
+        shell: bash
+        run: |
+          unformatted=$(gofmt -l .)
+          if [ -n "$unformatted" ]; then
+            echo "These files are not gofmt-ed:"
+            echo "$unformatted"
+            exit 1
+          fi
+
+      - name: Vet
+        run: go vet ./...
+
+      - name: Test (race + coverage)
+        run: go test -race -covermode=atomic -coverprofile=coverage.out ./...
+
+  benchmarks-build:
+    name: benchmarks module builds
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: "1.26"
+          check-latest: true
+
+      # The benchmarks live in their own module (with the lxzan dependency) so it
+      # never enters the main module. Compile them without running the long
+      # benchmarks, just to keep the cross-comparison code from rotting.
+      - name: Vet benchmarks module
+        working-directory: ./benchmarks
+        run: go vet ./...
+
+      - name: Compile benchmarks (no run)
+        working-directory: ./benchmarks
+        run: go test -run '^$' -bench '^$' ./...
