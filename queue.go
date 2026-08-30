@@ -56,6 +56,7 @@ type Queue struct {
 	idle           []*worker // parked workers (LIFO, to reuse the hottest stack)
 	pool           sync.Pool // recycles worker objects to avoid channel allocs
 	running        int       // workers currently executing a task (parked excluded)
+	submitPending  int       // outstanding jobs admitted through Submit
 	stopped        bool
 	janitorRunning bool
 
@@ -75,14 +76,18 @@ func New(opts ...Option) *Queue {
 // it is queued. A nil job is ignored, since nil is used internally as a
 // worker's exit signal.
 func (q *Queue) Push(job Job) {
+	_ = q.push(job)
+}
+
+func (q *Queue) push(job Job) bool {
 	if job == nil {
-		return
+		return false
 	}
 
 	q.mu.Lock()
 	if q.stopped {
 		q.mu.Unlock()
-		return
+		return false
 	}
 
 	// 1) A parked worker exists: wake it to reuse its grown stack, taking the
@@ -94,7 +99,7 @@ func (q *Queue) Push(job Job) {
 		q.running++
 		q.mu.Unlock()
 		w.ch <- job // buffered channel with a receiver waiting; never blocks
-		return
+		return true
 	}
 
 	// 2) No parked worker and the concurrency limit is not reached: start one.
@@ -102,11 +107,48 @@ func (q *Queue) Push(job Job) {
 		q.running++
 		q.mu.Unlock()
 		q.spawn(q.acquire(), job)
-		return
+		return true
 	}
 
 	// 3) At capacity: enqueue and let a looping worker pick it up.
 	q.backlog.push(job)
+	q.mu.Unlock()
+	return true
+}
+
+// Submit admits a task without blocking. It returns false when the queue has
+// been stopped or the optional WithMaxPending limit is full. Unlike Push, the
+// admitted task count includes both running and queued jobs, so a caller can
+// use Submit as a bounded executor primitive.
+func (q *Queue) Submit(job Job) bool {
+	if job == nil {
+		return false
+	}
+	if q.opt.maxPending <= 0 {
+		return q.push(job)
+	}
+
+	q.mu.Lock()
+	if q.stopped || q.submitPending >= q.opt.maxPending {
+		q.mu.Unlock()
+		return false
+	}
+	q.submitPending++
+	q.mu.Unlock()
+
+	accepted := q.push(func() {
+		defer q.releaseSubmitted()
+		job()
+	})
+	if !accepted {
+		q.releaseSubmitted()
+	}
+	return accepted
+}
+
+func (q *Queue) releaseSubmitted() {
+	q.mu.Lock()
+	q.submitPending--
 	q.mu.Unlock()
 }
 

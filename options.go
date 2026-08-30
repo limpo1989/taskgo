@@ -22,6 +22,7 @@ const (
 	defaultConcurrency = 8
 	defaultMaxIdle     = 0 // 0 means no parking: a worker exits once the queue drains
 	defaultMaxJobs     = 0 // 0 means no per-worker task limit
+	defaultMaxPending  = 0 // 0 means Submit is not admission-limited
 	defaultTimeout     = 30 * time.Second
 )
 
@@ -29,6 +30,7 @@ type options struct {
 	concurrency int           // maximum number of concurrent workers
 	maxIdle     time.Duration // how long a worker may stay parked; <=0 disables parking
 	maxJobs     int           // task count after which a worker is recycled; <=0 means no limit
+	maxPending  int           // maximum outstanding Submit jobs; <=0 means no limit
 	timeout     time.Duration // how long Stop waits for outstanding tasks
 	panicFn     func(v any)   // task panic handler; when non-nil, panics are recovered
 
@@ -46,6 +48,7 @@ func newOptions(opts []Option) *options {
 		concurrency: defaultConcurrency,
 		maxIdle:     defaultMaxIdle,
 		maxJobs:     defaultMaxJobs,
+		maxPending:  defaultMaxPending,
 		timeout:     defaultTimeout,
 	}
 	for _, f := range opts {
@@ -62,6 +65,9 @@ func newOptions(opts []Option) *options {
 	}
 	if o.maxJobs < 0 {
 		o.maxJobs = 0
+	}
+	if o.maxPending < 0 {
+		o.maxPending = 0
 	}
 	if o.nowFn == nil {
 		o.nowFn = time.Now
@@ -99,6 +105,14 @@ func WithMaxIdle(d time.Duration) Option {
 // over many tasks. The default is 0, which imposes no limit.
 func WithMaxJobs(n int) Option {
 	return func(o *options) { o.maxJobs = n }
+}
+
+// WithMaxPending bounds the number of outstanding jobs accepted by Submit.
+// Push keeps its legacy unbounded behavior. The default is 0, which leaves
+// Submit admission-unlimited; callers that need non-blocking overload
+// rejection should set an explicit bound.
+func WithMaxPending(n int) Option {
+	return func(o *options) { o.maxPending = n }
 }
 
 // WithTimeout sets how long Stop waits for outstanding tasks. The default is 30s.

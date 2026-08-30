@@ -42,6 +42,7 @@ type Job func()
 func New(opts ...Option) *Queue
 
 func (q *Queue) Push(job Job)               // submit a task (nil is ignored)
+func (q *Queue) Submit(job Job) bool        // non-blocking bounded submit
 func (q *Queue) Len() int                   // tasks queued but not yet started
 func (q *Queue) Stop(ctx context.Context) error // drain and shut down
 
@@ -49,6 +50,7 @@ func (q *Queue) Stop(ctx context.Context) error // drain and shut down
 func WithConcurrency(n int) Option           // max concurrent workers (default 8)
 func WithMaxIdle(d time.Duration) Option     // park idle workers for d (default 0 = off)
 func WithMaxJobs(n int) Option               // recycle a worker after n tasks (default 0 = off)
+func WithMaxPending(n int) Option            // bound outstanding Submit jobs (default 0 = off)
 func WithTimeout(d time.Duration) Option     // how long Stop waits (default 30s)
 func WithPanicHandler(fn func(v any)) Option // recover task panics
 ```
@@ -109,6 +111,10 @@ exits (parking disabled, stopped, or task cap reached) or **parks** on its own
 channel, waiting to be woken by the next `Push` or reclaimed by the background
 janitor after `maxIdle`. Parked workers are excluded from the running count, so
 `Stop` can tell when all real work is done.
+
+`Submit` is the executor-oriented API. With `WithMaxPending(n)`, it rejects
+without blocking once `n` running or queued submissions are outstanding;
+legacy `Push` remains unbounded for compatibility.
 
 ## Tuning
 

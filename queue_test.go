@@ -317,6 +317,54 @@ func TestPushAfterStopDropped(t *testing.T) {
 	}
 }
 
+func TestSubmitRejectsAtPendingLimit(t *testing.T) {
+	q := New(WithConcurrency(1), WithMaxPending(2))
+	started := make(chan struct{})
+	release := make(chan struct{})
+	if !q.Submit(func() {
+		close(started)
+		<-release
+	}) {
+		t.Fatal("first Submit rejected")
+	}
+	<-started
+	if !q.Submit(func() {}) {
+		t.Fatal("second Submit rejected")
+	}
+	if q.Submit(func() {}) {
+		t.Fatal("third Submit accepted past pending limit")
+	}
+	close(release)
+	if err := q.Stop(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestSubmitReleasesPendingSlotAfterCompletion(t *testing.T) {
+	q := New(WithConcurrency(1), WithMaxPending(1))
+	done := make(chan struct{})
+	if !q.Submit(func() { close(done) }) {
+		t.Fatal("first Submit rejected")
+	}
+	<-done
+	if !q.Submit(func() {}) {
+		t.Fatal("Submit rejected after completed task")
+	}
+	if err := q.Stop(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestSubmitRejectsAfterStop(t *testing.T) {
+	q := New(WithMaxPending(1))
+	if err := q.Stop(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if q.Submit(func() {}) {
+		t.Fatal("Submit accepted after Stop")
+	}
+}
+
 func TestStopDispersesIdleWorkers(t *testing.T) {
 	q := New(WithConcurrency(3), WithMaxIdle(time.Minute), withManualJanitor())
 	var wg sync.WaitGroup
