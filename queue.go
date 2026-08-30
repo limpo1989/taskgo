@@ -56,11 +56,11 @@ type Queue struct {
 	idle           []*worker // parked workers (LIFO, to reuse the hottest stack)
 	pool           sync.Pool // recycles worker objects to avoid channel allocs
 	running        int       // workers currently executing a task (parked excluded)
-	submitPending  int       // outstanding jobs admitted through Submit
 	stopped        bool
 	janitorRunning bool
 
 	onSpawnForTest func() // test hook: invoked whenever a worker goroutine starts
+	submitPending  int    // outstanding jobs admitted through Submit
 }
 
 // New creates a task queue configured by opts.
@@ -76,7 +76,39 @@ func New(opts ...Option) *Queue {
 // it is queued. A nil job is ignored, since nil is used internally as a
 // worker's exit signal.
 func (q *Queue) Push(job Job) {
-	_ = q.push(job)
+	if job == nil {
+		return
+	}
+
+	q.mu.Lock()
+	if q.stopped {
+		q.mu.Unlock()
+		return
+	}
+
+	// 1) A parked worker exists: wake it to reuse its grown stack, taking the
+	// most recently used one (LIFO).
+	if k := len(q.idle); k > 0 {
+		w := q.idle[k-1]
+		q.idle[k-1] = nil
+		q.idle = q.idle[:k-1]
+		q.running++
+		q.mu.Unlock()
+		w.ch <- job // buffered channel with a receiver waiting; never blocks
+		return
+	}
+
+	// 2) No parked worker and the concurrency limit is not reached: start one.
+	if q.running < q.opt.concurrency {
+		q.running++
+		q.mu.Unlock()
+		q.spawn(q.acquire(), job)
+		return
+	}
+
+	// 3) At capacity: enqueue and let a looping worker pick it up.
+	q.backlog.push(job)
+	q.mu.Unlock()
 }
 
 func (q *Queue) push(job Job) bool {

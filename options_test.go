@@ -24,7 +24,7 @@ import (
 func TestOptionDefaults(t *testing.T) {
 	o := newOptions(nil)
 	if o.concurrency != defaultConcurrency || o.timeout != defaultTimeout ||
-		o.maxIdle != 0 || o.maxJobs != 0 || o.nowFn == nil {
+		o.maxIdle != 0 || o.maxJobs != 0 || o.maxPending != defaultMaxPending || o.nowFn == nil {
 		t.Fatalf("unexpected defaults: %+v", o)
 	}
 }
@@ -35,6 +35,7 @@ func TestOptionNegativeNormalization(t *testing.T) {
 		WithTimeout(-time.Second),
 		WithMaxIdle(-time.Second),
 		WithMaxJobs(-5),
+		WithMaxPending(-7),
 	})
 	if o.concurrency != defaultConcurrency {
 		t.Fatalf("concurrency = %d", o.concurrency)
@@ -48,6 +49,9 @@ func TestOptionNegativeNormalization(t *testing.T) {
 	if o.maxJobs != 0 {
 		t.Fatalf("maxJobs = %d", o.maxJobs)
 	}
+	if o.maxPending != 0 {
+		t.Fatalf("maxPending = %d", o.maxPending)
+	}
 }
 
 func TestOptionSetters(t *testing.T) {
@@ -55,10 +59,11 @@ func TestOptionSetters(t *testing.T) {
 		WithConcurrency(3),
 		WithMaxIdle(5 * time.Second),
 		WithMaxJobs(100),
+		WithMaxPending(200),
 		WithTimeout(2 * time.Second),
 		WithPanicHandler(func(any) {}),
 	})
-	if o.concurrency != 3 || o.maxIdle != 5*time.Second || o.maxJobs != 100 ||
+	if o.concurrency != 3 || o.maxIdle != 5*time.Second || o.maxJobs != 100 || o.maxPending != 200 ||
 		o.timeout != 2*time.Second || o.panicFn == nil {
 		t.Fatalf("unexpected: %+v", o)
 	}
