@@ -42,7 +42,7 @@ type Job func()
 func New(opts ...Option) *Queue
 
 func (q *Queue) Push(job Job)               // submit a task (nil is ignored)
-func (q *Queue) Submit(job Job) bool        // non-blocking bounded submit
+func (q *Queue) Submit(job func()) bool     // non-blocking bounded submit
 func (q *Queue) Len() int                   // tasks queued but not yet started
 func (q *Queue) Stop(ctx context.Context) error // drain and shut down
 

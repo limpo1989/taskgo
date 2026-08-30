@@ -152,7 +152,7 @@ func (q *Queue) push(job Job) bool {
 // been stopped or the optional WithMaxPending limit is full. Unlike Push, the
 // admitted task count includes both running and queued jobs, so a caller can
 // use Submit as a bounded executor primitive.
-func (q *Queue) Submit(job Job) bool {
+func (q *Queue) Submit(job func()) bool {
 	if job == nil {
 		return false
 	}

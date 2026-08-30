@@ -25,6 +25,8 @@ import (
 	"time"
 )
 
+var _ interface{ Submit(func()) bool } = (*Queue)(nil)
+
 // ---------- Push behavior ----------
 
 func TestPushExecutesAllTasks(t *testing.T) {
