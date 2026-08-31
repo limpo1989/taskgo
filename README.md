@@ -218,6 +218,18 @@ go test -run '^$' -bench 'BenchmarkBurst|BenchmarkSaturated' -benchmem
 go test -run '^$' -bench 'BenchmarkHighConcurrency' -benchmem
 ```
 
+The real-time sawtooth, long-tail, and max-idle experiments depend on OS timer
+resolution, CPU capacity, scheduler load, and race instrumentation. They are
+opt-in so ordinary cross-platform unit tests do not assert statistical ordering
+between different machines:
+
+```sh
+TASKGO_RUN_EXPERIMENTS=1 go test -v -run 'TestSawtoothMitigations|TestLongTailMitigations|TestHeavyTailCap|TestMaxIdleSweep'
+```
+
+`TestSawtoothJitter` uses a simulated clock and remains part of the default
+deterministic test suite.
+
 ## License
 
 Apache License 2.0. See [LICENSE](LICENSE).
