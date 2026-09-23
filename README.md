@@ -38,13 +38,26 @@ go get github.com/limpo1989/taskgo@latest
 
 ```go
 type Job func()
+type Task[T any] struct { ... }
 
 func New(opts ...Option) *Queue
+func NewTask[T any](fn func(T), opts ...Option) *Task[T]
 
 func (q *Queue) Push(job Job)               // submit a task (nil is ignored)
-func (q *Queue) Submit(job func()) bool     // non-blocking bounded submit
+func (q *Queue) PushBatch(jobs []Job) int    // submit jobs, return accepted count
+func (q *Queue) Submit(job Job) bool        // non-blocking bounded submit
+func (q *Queue) SubmitBatch(jobs []Job) int  // accept a prefix up to the limit
+func (q *Queue) TrySubmitBatch(jobs []Job) bool // all-or-nothing batch submit
 func (q *Queue) Len() int                   // tasks queued but not yet started
 func (q *Queue) Stop(ctx context.Context) error // drain and shut down
+
+func (q *Task[T]) Push(value T)              // submit a value to the bound fn
+func (q *Task[T]) PushBatch(values []T) int   // submit a batch, return accepted count
+func (q *Task[T]) Submit(value T) bool        // non-blocking bounded submit
+func (q *Task[T]) SubmitBatch(values []T) int // accept a prefix up to the limit
+func (q *Task[T]) TrySubmitBatch(values []T) bool // all-or-nothing batch submit
+func (q *Task[T]) Len() int
+func (q *Task[T]) Stop(ctx context.Context) error
 
 // Options
 func WithConcurrency(n int) Option           // max concurrent workers (default 8)
@@ -96,6 +109,31 @@ func main() {
 	_ = q.Stop(context.Background())
 }
 ```
+
+When all tasks call the same function with different data, bind that function
+once with `NewTask`:
+
+```go
+q := taskgo.NewTask(func(value int) {
+	_ = fib(value)
+}, taskgo.WithConcurrency(16))
+for i := 0; i < 10000; i++ {
+	q.Push(20)
+}
+_ = q.Stop(context.Background())
+```
+
+`Task[T].Push` stores `T` directly in the queue. It avoids creating a new
+closure for each submission, which can reduce allocations and submission-side
+CPU when the task function is shared and the work itself is small. It does not
+remove the cost of worker scheduling or make expensive task bodies faster.
+
+Batch methods preserve input order when admitting values. `SubmitBatch` returns
+the number accepted, and those accepted values are exactly `values[:n]`; the
+rest were rejected by the pending limit or shutdown. Use `TrySubmitBatch` when
+partial submission is not acceptable. FIFO controls queue order; with
+concurrency greater than one, task start and completion order can still
+interleave. Use `WithConcurrency(1)` when execution order must be strict.
 
 ## How it works
 
@@ -216,7 +254,21 @@ pulls in nothing but the standard library. Reproduce with:
 cd benchmarks
 go test -run '^$' -bench 'BenchmarkBurst|BenchmarkSaturated' -benchmem
 go test -run '^$' -bench 'BenchmarkHighConcurrency' -benchmem
+go test -run '^$' -bench 'BenchmarkTyped(Burst|Saturated)' -benchmem
+go test -run '^$' -bench 'BenchmarkTypedHighConcurrency' -benchmem
+go test -run '^$' -bench 'BenchmarkConcurrentProducers' -benchmem
 ```
+
+The typed-versus-closure submission benchmark is part of the main module:
+
+```sh
+go test -run '^$' -bench 'BenchmarkPush(Closure|Typed)$' -benchmem
+```
+
+On the reference machine, the typed path reports 0 allocations per operation,
+while a closure capturing the same value reports 1 allocation (about 24 bytes).
+The `BenchmarkTyped*` cases in `benchmarks/` compare `Task[int]` with the
+legacy `Queue` under the same burst, saturation, and high-concurrency loads.
 
 The real-time sawtooth, long-tail, and max-idle experiments depend on OS timer
 resolution, CPU capacity, scheduler load, and race instrumentation. They are

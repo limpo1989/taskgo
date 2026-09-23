@@ -25,6 +25,9 @@
 //
 //	go test -run '^$' -bench 'BenchmarkBurst|BenchmarkSaturated' -benchmem
 //	go test -run '^$' -bench 'BenchmarkHighConcurrency' -benchmem
+//	go test -run '^$' -bench 'BenchmarkTypedBurst|BenchmarkTypedSaturated' -benchmem
+//	go test -run '^$' -bench 'BenchmarkTypedHighConcurrency' -benchmem
+//	go test -run '^$' -bench 'BenchmarkConcurrentProducers' -benchmem
 package benchmarks
 
 import (
@@ -145,6 +148,62 @@ func workloads() []workload {
 	}
 }
 
+// typedPool drives Task[int]. The task function is bound once when the pool is
+// created; submitBatch only passes integer values and waits on a shared channel
+// for completion. This keeps the benchmark from reintroducing one closure per
+// submitted value.
+type typedPool interface {
+	submitBatch(n int)
+	stop()
+}
+
+type taskgoTypedPool struct {
+	q    *taskgo.Task[int]
+	work func()
+	done chan struct{}
+}
+
+func newTaskgoTypedPool(concurrency int, reuse bool, work func()) *taskgoTypedPool {
+	p := &taskgoTypedPool{work: work}
+	opts := []taskgo.Option{taskgo.WithConcurrency(concurrency)}
+	if reuse {
+		opts = append(opts, taskgo.WithMaxIdle(time.Second))
+	}
+	p.q = taskgo.NewTask(func(int) {
+		p.work()
+		p.done <- struct{}{}
+	}, opts...)
+	return p
+}
+
+func (p *taskgoTypedPool) submitBatch(n int) {
+	p.done = make(chan struct{}, n)
+	for i := 0; i < n; i++ {
+		p.q.Push(i)
+	}
+	for i := 0; i < n; i++ {
+		<-p.done
+	}
+}
+
+func (p *taskgoTypedPool) stop() { _ = p.q.Stop(context.Background()) }
+
+type typedEngine struct {
+	name string
+	make func(concurrency int, work func()) typedPool
+}
+
+func typedEngines() []typedEngine {
+	return []typedEngine{
+		{"taskgo-Task-NoReuse", func(c int, work func()) typedPool {
+			return newTaskgoTypedPool(c, false, work)
+		}},
+		{"taskgo-Task-Reuse", func(c int, work func()) typedPool {
+			return newTaskgoTypedPool(c, true, work)
+		}},
+	}
+}
+
 // submitBatch submits n tasks to p and waits for all of them to finish.
 func submitBatch(p pool, n int, task func()) {
 	var wg sync.WaitGroup
@@ -254,6 +313,136 @@ func BenchmarkHighConcurrency(b *testing.B) {
 					p.stop()
 				})
 			}
+		}
+	}
+}
+
+// ----------------------------------------------------------------------------
+// Scenario D: typed Task comparison.
+//
+// These scenarios mirror the legacy benchmarks above, but use Task[int] and a
+// function bound once at construction. The workload and worker settings match
+// the corresponding legacy scenario, so the difference isolates submission
+// overhead from per-value closures.
+// ----------------------------------------------------------------------------
+
+func BenchmarkTypedBurst(b *testing.B) {
+	for _, wl := range workloads() {
+		for _, eng := range typedEngines() {
+			b.Run(wl.name+"/"+eng.name, func(b *testing.B) {
+				p := eng.make(burstConcurrency, wl.task)
+				b.ResetTimer()
+				for i := 0; i < b.N; i++ {
+					for k := 0; k < burstBatches; k++ {
+						p.submitBatch(burstConcurrency)
+					}
+				}
+				b.StopTimer()
+				p.stop()
+			})
+		}
+	}
+}
+
+func BenchmarkTypedSaturated(b *testing.B) {
+	for _, wl := range workloads() {
+		for _, eng := range typedEngines() {
+			b.Run(wl.name+"/"+eng.name, func(b *testing.B) {
+				p := eng.make(satConcurrency, wl.task)
+				b.ResetTimer()
+				for i := 0; i < b.N; i++ {
+					p.submitBatch(satBatch)
+				}
+				b.StopTimer()
+				p.stop()
+			})
+		}
+	}
+}
+
+func BenchmarkTypedHighConcurrency(b *testing.B) {
+	loads := []int{1000, 10000, 100000, 500000}
+	for _, wl := range workloads() {
+		for _, load := range loads {
+			for _, eng := range typedEngines() {
+				name := fmt.Sprintf("%s/load=%d/%s", wl.name, load, eng.name)
+				b.Run(name, func(b *testing.B) {
+					p := eng.make(highConcurrency, wl.task)
+					b.ResetTimer()
+					for i := 0; i < b.N; i++ {
+						p.submitBatch(load)
+					}
+					b.StopTimer()
+					p.stop()
+				})
+			}
+		}
+	}
+}
+
+// Scenario E: multiple producers submit to one saturated queue. Both paths
+// execute the same shallow task; the legacy path captures the submitted value
+// in a closure, while Task[int] passes it directly.
+func BenchmarkConcurrentProducers(b *testing.B) {
+	const producers = 16
+	const concurrency = 48
+	for _, reuse := range []bool{false, true} {
+		mode := "NoReuse"
+		opts := []taskgo.Option{taskgo.WithConcurrency(concurrency)}
+		if reuse {
+			mode = "Reuse"
+			opts = append(opts, taskgo.WithMaxIdle(time.Second))
+		}
+		for _, typed := range []bool{false, true} {
+			name := "Queue/" + mode
+			if typed {
+				name = "Task[int]/" + mode
+			}
+			b.Run(name, func(b *testing.B) {
+				var done sync.WaitGroup
+				done.Add(b.N)
+				var push func(int)
+				var stop func()
+				if typed {
+					q := taskgo.NewTask(func(value int) {
+						if value < 0 {
+							panic("unreachable")
+						}
+						shallowTask()
+						done.Done()
+					}, opts...)
+					push = q.Push
+					stop = func() { _ = q.Stop(context.Background()) }
+				} else {
+					q := taskgo.New(opts...)
+					push = func(value int) {
+						q.Push(func() {
+							if value < 0 {
+								panic("unreachable")
+							}
+							shallowTask()
+							done.Done()
+						})
+					}
+					stop = func() { _ = q.Stop(context.Background()) }
+				}
+
+				b.ResetTimer()
+				var producersDone sync.WaitGroup
+				producersDone.Add(producers)
+				for producer := 0; producer < producers; producer++ {
+					go func(producer int) {
+						defer producersDone.Done()
+						for value := producer; value < b.N; value += producers {
+							push(value)
+						}
+					}(producer)
+				}
+				producersDone.Wait()
+				done.Wait()
+				b.StopTimer()
+				stop()
+			})
 		}
 	}
 }

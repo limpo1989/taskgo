@@ -25,7 +25,12 @@ import (
 	"time"
 )
 
-var _ interface{ Submit(func()) bool } = (*Queue)(nil)
+var _ interface{ Submit(Job) bool } = (*Queue)(nil)
+var _ interface {
+	PushBatch([]Job) int
+	SubmitBatch([]Job) int
+	TrySubmitBatch([]Job) bool
+} = (*Queue)(nil)
 
 // ---------- Push behavior ----------
 
@@ -57,6 +62,81 @@ func TestPushNilIgnored(t *testing.T) {
 		t.Fatal("nil push should not start a worker")
 	}
 	_ = q.Stop(context.Background())
+}
+
+func TestQueueBatchNilJobsIgnored(t *testing.T) {
+	q := New()
+	if got := q.PushBatch([]Job{nil}); got != 0 {
+		t.Fatalf("PushBatch accepted %d nil jobs", got)
+	}
+	if got := q.SubmitBatch([]Job{nil}); got != 0 {
+		t.Fatalf("SubmitBatch accepted %d nil jobs", got)
+	}
+	if !q.TrySubmitBatch([]Job{nil}) {
+		t.Fatal("TrySubmitBatch rejected an empty valid batch")
+	}
+	_ = q.Stop(context.Background())
+}
+
+func TestQueueTrySubmitBatchIsAtomic(t *testing.T) {
+	started := make(chan struct{})
+	release := make(chan struct{})
+	q := New(WithConcurrency(1), WithMaxPending(2))
+	if !q.Submit(func() {
+		close(started)
+		<-release
+	}) {
+		t.Fatal("initial Submit rejected")
+	}
+	<-started
+	if q.TrySubmitBatch([]Job{func() {}, func() {}}) {
+		t.Fatal("oversized batch was accepted")
+	}
+	if q.Len() != 0 {
+		t.Fatalf("Len = %d after rejected batch, want 0", q.Len())
+	}
+	close(release)
+	if err := q.Stop(context.Background()); err != nil {
+		t.Fatalf("stop: %v", err)
+	}
+}
+
+func TestQueueBatchMethodsPreserveAcceptedPrefix(t *testing.T) {
+	started := make(chan struct{})
+	release := make(chan struct{})
+	got := make(chan int, 3)
+	q := New(WithConcurrency(1), WithMaxPending(2))
+	if !q.Submit(func() {
+		close(started)
+		<-release
+		got <- 0
+	}) {
+		t.Fatal("initial Submit rejected")
+	}
+	<-started
+	if accepted := q.SubmitBatch([]Job{
+		func() { got <- 1 },
+		func() { got <- 2 },
+	}); accepted != 1 {
+		t.Fatalf("accepted = %d, want 1", accepted)
+	}
+	close(release)
+	if err := q.Stop(context.Background()); err != nil {
+		t.Fatalf("stop: %v", err)
+	}
+	for _, want := range []int{0, 1} {
+		if gotValue := <-got; gotValue != want {
+			t.Fatalf("got = %d, want %d", gotValue, want)
+		}
+	}
+
+	q2 := New(WithConcurrency(1))
+	if !q2.TrySubmitBatch([]Job{func() {}, func() {}}) {
+		t.Fatal("TrySubmitBatch rejected an unbounded batch")
+	}
+	if err := q2.Stop(context.Background()); err != nil {
+		t.Fatalf("stop q2: %v", err)
+	}
 }
 
 func TestConcurrencyLimit(t *testing.T) {

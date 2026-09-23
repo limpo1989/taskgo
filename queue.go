@@ -37,127 +37,130 @@ type Job func()
 // stopCheckInterval is how often Stop polls for completion while draining.
 const stopCheckInterval = 100 * time.Millisecond
 
-// worker holds a wake-up channel and the time it last became idle.
-type worker struct {
-	// ch has a buffer of 1. Sending a job wakes the worker; sending nil tells
-	// it to exit.
-	ch chan Job
-	// lastUsed records when the worker entered the idle set, so the janitor can
-	// decide whether it has expired.
+// Task is a typed task queue. The function is bound when the queue is created,
+// so Push only stores a value and does not allocate a per-task closure.
+//
+// The zero value is not usable; create one with NewTask.
+type Task[T any] struct {
+	*taskQueue[T]
+}
+
+// NewTask creates a typed task queue that invokes fn for every value submitted
+// with Push or Submit. fn must be non-nil.
+func NewTask[T any](fn func(T), opts ...Option) *Task[T] {
+	if fn == nil {
+		panic("taskgo: nil task function")
+	}
+	return &Task[T]{taskQueue: newTaskQueue(opts, fn)}
+}
+
+// Push submits value to the bound typed task function.
+func (q *Task[T]) Push(value T) {
+	q.taskQueue.push(value)
+}
+
+// PushBatch submits values and returns the number accepted. Values are stored
+// directly in the queue; no per-value closure is created. A concurrent Stop
+// can cause the result to be less than len(values).
+func (q *Task[T]) PushBatch(values []T) int {
+	return q.taskQueue.pushBatch(values)
+}
+
+// Submit admits a typed task without blocking. It returns false when the queue
+// has been stopped or the optional WithMaxPending limit is full.
+func (q *Task[T]) Submit(value T) bool {
+	return q.taskQueue.submit(value)
+}
+
+// SubmitBatch submits as many values as the pending limit allows and returns
+// the number accepted. When the queue is bounded, accepted values are the
+// prefix of values that fits in the currently available pending capacity.
+func (q *Task[T]) SubmitBatch(values []T) int {
+	accepted, _ := q.taskQueue.submitBatch(values, false)
+	return accepted
+}
+
+// TrySubmitBatch atomically submits the entire batch. It returns false and
+// accepts no values when the queue is stopped or the pending limit cannot hold
+// the complete batch.
+func (q *Task[T]) TrySubmitBatch(values []T) bool {
+	_, ok := q.taskQueue.submitBatch(values, true)
+	return ok
+}
+
+// taskMessage is sent to a parked worker. A separate stop bit is used instead
+// of a sentinel value so every T, including nil and its zero value, is valid.
+type taskMessage[T any] struct {
+	item taskItem[T]
+	stop bool
+}
+
+type taskItem[T any] struct {
+	value     T
+	submitted bool
+}
+
+type taskDispatch[T any] struct {
+	worker *worker[T]
+	item   taskItem[T]
+}
+
+type worker[T any] struct {
+	ch       chan taskMessage[T]
 	lastUsed time.Time
 }
 
-// Queue is a concurrency-limited task queue. The zero value is not usable;
-// create one with New.
-type Queue struct {
+// taskQueue contains the scheduling implementation shared by Queue and Task.
+// run is bound once at construction and is called directly with each queued T.
+type taskQueue[T any] struct {
 	mu             sync.Mutex
 	opt            *options
-	backlog        *ring     // tasks queued (FIFO) while all workers are busy
-	idle           []*worker // parked workers (LIFO, to reuse the hottest stack)
-	pool           sync.Pool // recycles worker objects to avoid channel allocs
-	running        int       // workers currently executing a task (parked excluded)
+	backlog        *taskRing[T]
+	idle           []*worker[T]
+	pool           sync.Pool
+	running        int
 	stopped        bool
 	janitorRunning bool
 
-	onSpawnForTest func() // test hook: invoked whenever a worker goroutine starts
-	submitPending  int    // outstanding jobs admitted through Submit
+	onSpawnForTest func()
+	submitPending  int
+	run            func(T)
 }
 
-// New creates a task queue configured by opts.
-func New(opts ...Option) *Queue {
-	o := newOptions(opts)
-	return &Queue{
-		opt:     o,
-		backlog: newRing(8),
+func newTaskQueue[T any](opts []Option, run func(T)) *taskQueue[T] {
+	return &taskQueue[T]{
+		opt:     newOptions(opts),
+		backlog: newTaskRing[T](8),
+		run:     run,
 	}
 }
 
-// Push submits a task. It runs immediately if a worker is available, otherwise
-// it is queued. A nil job is ignored, since nil is used internally as a
-// worker's exit signal.
-func (q *Queue) Push(job Job) {
-	if job == nil {
-		return
+func (q *taskQueue[T]) push(value T) bool {
+	return q.pushItem(taskItem[T]{value: value})
+}
+
+func (q *taskQueue[T]) pushBatch(values []T) int {
+	if len(values) == 0 {
+		return 0
 	}
 
 	q.mu.Lock()
 	if q.stopped {
 		q.mu.Unlock()
-		return
+		return 0
 	}
-
-	// 1) A parked worker exists: wake it to reuse its grown stack, taking the
-	// most recently used one (LIFO).
-	if k := len(q.idle); k > 0 {
-		w := q.idle[k-1]
-		q.idle[k-1] = nil
-		q.idle = q.idle[:k-1]
-		q.running++
-		q.mu.Unlock()
-		w.ch <- job // buffered channel with a receiver waiting; never blocks
-		return
+	actions := make([]taskDispatch[T], 0, q.batchDispatchCapacity(len(values)))
+	for _, value := range values {
+		q.enqueueItemLocked(taskItem[T]{value: value}, &actions)
 	}
-
-	// 2) No parked worker and the concurrency limit is not reached: start one.
-	if q.running < q.opt.concurrency {
-		q.running++
-		q.mu.Unlock()
-		q.spawn(q.acquire(), job)
-		return
-	}
-
-	// 3) At capacity: enqueue and let a looping worker pick it up.
-	q.backlog.push(job)
 	q.mu.Unlock()
+	q.dispatchBatch(actions)
+	return len(values)
 }
 
-func (q *Queue) push(job Job) bool {
-	if job == nil {
-		return false
-	}
-
-	q.mu.Lock()
-	if q.stopped {
-		q.mu.Unlock()
-		return false
-	}
-
-	// 1) A parked worker exists: wake it to reuse its grown stack, taking the
-	// most recently used one (LIFO).
-	if k := len(q.idle); k > 0 {
-		w := q.idle[k-1]
-		q.idle[k-1] = nil
-		q.idle = q.idle[:k-1]
-		q.running++
-		q.mu.Unlock()
-		w.ch <- job // buffered channel with a receiver waiting; never blocks
-		return true
-	}
-
-	// 2) No parked worker and the concurrency limit is not reached: start one.
-	if q.running < q.opt.concurrency {
-		q.running++
-		q.mu.Unlock()
-		q.spawn(q.acquire(), job)
-		return true
-	}
-
-	// 3) At capacity: enqueue and let a looping worker pick it up.
-	q.backlog.push(job)
-	q.mu.Unlock()
-	return true
-}
-
-// Submit admits a task without blocking. It returns false when the queue has
-// been stopped or the optional WithMaxPending limit is full. Unlike Push, the
-// admitted task count includes both running and queued jobs, so a caller can
-// use Submit as a bounded executor primitive.
-func (q *Queue) Submit(job func()) bool {
-	if job == nil {
-		return false
-	}
+func (q *taskQueue[T]) submit(value T) bool {
 	if q.opt.maxPending <= 0 {
-		return q.push(job)
+		return q.push(value)
 	}
 
 	q.mu.Lock()
@@ -168,24 +171,123 @@ func (q *Queue) Submit(job func()) bool {
 	q.submitPending++
 	q.mu.Unlock()
 
-	accepted := q.push(func() {
-		defer q.releaseSubmitted()
-		job()
-	})
+	accepted := q.pushItem(taskItem[T]{value: value, submitted: true})
 	if !accepted {
 		q.releaseSubmitted()
 	}
 	return accepted
 }
 
-func (q *Queue) releaseSubmitted() {
+func (q *taskQueue[T]) submitBatch(values []T, atomicBatch bool) (accepted int, allAccepted bool) {
 	q.mu.Lock()
-	q.submitPending--
+	if q.stopped {
+		q.mu.Unlock()
+		return 0, false
+	}
+	if len(values) == 0 {
+		q.mu.Unlock()
+		return 0, true
+	}
+
+	accepted = len(values)
+	if q.opt.maxPending > 0 {
+		available := q.opt.maxPending - q.submitPending
+		if atomicBatch && available < accepted {
+			q.mu.Unlock()
+			return 0, false
+		}
+		if available < accepted {
+			accepted = available
+		}
+		if accepted == 0 {
+			q.mu.Unlock()
+			return 0, false
+		}
+		q.submitPending += accepted
+	}
+
+	submitted := q.opt.maxPending > 0
+	actions := make([]taskDispatch[T], 0, q.batchDispatchCapacity(accepted))
+	for _, value := range values[:accepted] {
+		q.enqueueItemLocked(taskItem[T]{value: value, submitted: submitted}, &actions)
+	}
 	q.mu.Unlock()
+	q.dispatchBatch(actions)
+	return accepted, accepted == len(values)
+}
+
+func (q *taskQueue[T]) pushItem(item taskItem[T]) bool {
+	q.mu.Lock()
+	if q.stopped {
+		q.mu.Unlock()
+		return false
+	}
+	// Keep the single-item path allocation-free. The batch path collects
+	// dispatch actions, but Push and Submit are hot enough that an action slice
+	// here would escape once passed to dispatchBatch.
+	if k := len(q.idle); k > 0 {
+		w := q.idle[k-1]
+		q.idle[k-1] = nil
+		q.idle = q.idle[:k-1]
+		q.running++
+		q.mu.Unlock()
+		w.ch <- taskMessage[T]{item: item}
+		return true
+	}
+	if q.running < q.opt.concurrency {
+		q.running++
+		q.mu.Unlock()
+		q.spawn(q.acquire(), item.value, item.submitted)
+		return true
+	}
+	q.backlog.push(item)
+	q.mu.Unlock()
+	return true
+}
+
+func (q *taskQueue[T]) enqueueItemLocked(item taskItem[T], actions *[]taskDispatch[T]) {
+
+	// 1) A parked worker exists: wake it to reuse its grown stack, taking the
+	// most recently used one (LIFO).
+	if k := len(q.idle); k > 0 {
+		w := q.idle[k-1]
+		q.idle[k-1] = nil
+		q.idle = q.idle[:k-1]
+		q.running++
+		*actions = append(*actions, taskDispatch[T]{worker: w, item: item})
+		return
+	}
+
+	// 2) No parked worker and the concurrency limit is not reached: start one.
+	if q.running < q.opt.concurrency {
+		q.running++
+		*actions = append(*actions, taskDispatch[T]{item: item})
+		return
+	}
+
+	// 3) At capacity: enqueue and let a looping worker pick it up.
+	q.backlog.push(item)
+}
+
+func (q *taskQueue[T]) batchDispatchCapacity(n int) int {
+	if n > q.opt.concurrency {
+		return q.opt.concurrency
+	}
+	return n
+}
+
+func (q *taskQueue[T]) dispatchBatch(actions []taskDispatch[T]) {
+	for _, action := range actions {
+		if action.worker != nil {
+			action.worker.ch <- taskMessage[T]{item: action.item}
+			continue
+		}
+		q.spawn(q.acquire(), action.item.value, action.item.submitted)
+	}
 }
 
 // Len returns the number of tasks queued but not yet started.
-func (q *Queue) Len() int {
+func (q *taskQueue[T]) Len() int {
 	q.mu.Lock()
 	defer q.mu.Unlock()
 	return q.backlog.len()
@@ -197,7 +299,7 @@ func (q *Queue) Len() int {
 // tasks still run to completion, until they all finish or the deadline implied
 // by ctx and WithTimeout is reached. Stop returns nil on a clean drain, or the
 // context error on timeout or cancellation.
-func (q *Queue) Stop(ctx context.Context) error {
+func (q *taskQueue[T]) Stop(ctx context.Context) error {
 	q.mu.Lock()
 	if q.stopped {
 		q.mu.Unlock()
@@ -210,7 +312,7 @@ func (q *Queue) Stop(ctx context.Context) error {
 
 	// Dismiss every parked worker; each is blocked on <-w.ch.
 	for _, w := range idle {
-		w.ch <- nil
+		w.ch <- taskMessage[T]{stop: true}
 	}
 
 	ctx2, cancel := context.WithTimeout(ctx, q.opt.timeout)
@@ -224,10 +326,7 @@ func (q *Queue) Stop(ctx context.Context) error {
 		}
 		select {
 		case <-ticker.C:
-			// Loop back and let finished() do the check.
 		case <-ctx2.Done():
-			// A task may finish at the exact moment of timeout; treat that as a
-			// clean drain rather than an error.
 			if q.finished() {
 				return nil
 			}
@@ -236,8 +335,7 @@ func (q *Queue) Stop(ctx context.Context) error {
 	}
 }
 
-// finished reports whether nothing is queued or running.
-func (q *Queue) finished() bool {
+func (q *taskQueue[T]) finished() bool {
 	q.mu.Lock()
 	defer q.mu.Unlock()
 	return q.backlog.len()+q.running == 0
@@ -248,10 +346,13 @@ func (q *Queue) finished() bool {
 // On the hot path (the queue is non-empty and tasks are pulled back to back) it
 // takes only the mutex and uses no channel. It parks on its own channel to wait
 // for reuse or reclamation only when the queue is empty and parking is enabled.
-func (q *Queue) worker(w *worker, job Job) {
+func (q *taskQueue[T]) worker(w *worker[T], item taskItem[T]) {
 	n := 0
 	for {
-		q.exec(job)
+		q.exec(item.value)
+		if item.submitted {
+			q.releaseSubmitted()
+		}
 		n++
 		capReached := q.opt.maxJobs > 0 && n >= q.opt.maxJobs
 
@@ -262,12 +363,12 @@ func (q *Queue) worker(w *worker, job Job) {
 				// fresh worker (with a fresh stack) and exit. The running count
 				// is unchanged, as one leaves and one starts.
 				q.mu.Unlock()
-				q.spawn(q.acquire(), next)
+				q.spawn(q.acquire(), next.value, next.submitted)
 				q.release(w)
 				return
 			}
 			q.mu.Unlock()
-			job = next
+			item = next
 			continue
 		}
 
@@ -286,19 +387,19 @@ func (q *Queue) worker(w *worker, job Job) {
 		q.ensureJanitorLocked()
 		q.mu.Unlock()
 
-		job = <-w.ch
-		if job == nil { // exit signal, from the janitor's timeout or from Stop
+		message := <-w.ch
+		if message.stop {
 			q.release(w)
 			return
 		}
+		item = message.item
 		// Woken from parking: the GC may have shrunk the stack meanwhile, so
 		// reset the counter to avoid a premature maxJobs trigger.
 		n = 0
 	}
 }
 
-// exec runs a single job, recovering from a panic when a handler is configured.
-func (q *Queue) exec(job Job) {
+func (q *taskQueue[T]) exec(value T) {
 	if q.opt.panicFn != nil {
 		defer func() {
 			if v := recover(); v != nil {
@@ -306,35 +407,36 @@ func (q *Queue) exec(job Job) {
 			}
 		}()
 	}
-	job()
+	q.run(value)
 }
 
-// acquire returns a pooled worker, allocating a new one if the pool is empty.
-func (q *Queue) acquire() *worker {
+func (q *taskQueue[T]) acquire() *worker[T] {
 	if v := q.pool.Get(); v != nil {
-		return v.(*worker)
+		return v.(*worker[T])
 	}
-	return &worker{ch: make(chan Job, 1)}
+	return &worker[T]{
+		ch: make(chan taskMessage[T], 1),
+	}
 }
 
-// spawn starts a new worker goroutine. The caller is responsible for having
-// already accounted for it in the running count.
-func (q *Queue) spawn(w *worker, job Job) {
+func (q *taskQueue[T]) spawn(w *worker[T], value T, submitted bool) {
 	if q.onSpawnForTest != nil {
 		q.onSpawnForTest()
 	}
-	go q.worker(w, job)
+	go q.worker(w, taskItem[T]{value: value, submitted: submitted})
 }
-
-// release returns a worker to the pool for later reuse.
-func (q *Queue) release(w *worker) {
+func (q *taskQueue[T]) release(w *worker[T]) {
 	w.lastUsed = time.Time{}
 	q.pool.Put(w)
 }
 
-// ensureJanitorLocked starts the background reaper if it is not already
-// running. It must be called while holding mu.
-func (q *Queue) ensureJanitorLocked() {
+func (q *taskQueue[T]) releaseSubmitted() {
+	q.mu.Lock()
+	q.submitPending--
+	q.mu.Unlock()
+}
+
+func (q *taskQueue[T]) ensureJanitorLocked() {
 	if q.opt.manualJanitor {
 		return
 	}
@@ -344,9 +446,7 @@ func (q *Queue) ensureJanitorLocked() {
 	}
 }
 
-// janitor periodically reclaims workers that have been idle too long. It exits
-// once the idle set is empty and is restarted the next time a worker parks.
-func (q *Queue) janitor() {
+func (q *taskQueue[T]) janitor() {
 	for {
 		time.Sleep(q.opt.maxIdle)
 		if q.cleanExpired(q.opt.nowFn()) {
@@ -355,11 +455,9 @@ func (q *Queue) janitor() {
 	}
 }
 
-// cleanExpired reclaims every worker idle for at least maxIdle. It reports
-// whether the janitor should stop, which is the case when the idle set is empty.
-func (q *Queue) cleanExpired(now time.Time) (stop bool) {
+func (q *taskQueue[T]) cleanExpired(now time.Time) (stop bool) {
 	q.mu.Lock()
-	var expired []*worker
+	var expired []*worker[T]
 	dst := 0
 	for _, w := range q.idle {
 		if now.Sub(w.lastUsed) >= q.opt.maxIdle {
@@ -380,7 +478,7 @@ func (q *Queue) cleanExpired(now time.Time) (stop bool) {
 	q.mu.Unlock()
 
 	for _, w := range expired {
-		w.ch <- nil
+		w.ch <- taskMessage[T]{stop: true}
 	}
 	return stop
 }
