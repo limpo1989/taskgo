@@ -19,6 +19,7 @@ package taskgo
 import (
 	"context"
 	"sync"
+	"sync/atomic"
 	"time"
 )
 
@@ -34,6 +35,7 @@ type legacyWorker struct {
 //
 // The zero value is not usable; create one with New.
 type Queue struct {
+	submitPending  int64 // atomically released by workers; admission is serialized by mu
 	mu             sync.Mutex
 	opt            *options
 	backlog        *ring
@@ -44,7 +46,6 @@ type Queue struct {
 	janitorRunning bool
 
 	onSpawnForTest func()
-	submitPending  int
 }
 
 // New creates a legacy no-argument task queue configured by opts.
@@ -79,39 +80,13 @@ func (q *Queue) Submit(job Job) bool {
 	if q.opt.maxPending <= 0 {
 		return q.pushJob(job)
 	}
-
-	q.mu.Lock()
-	if q.stopped || q.submitPending >= q.opt.maxPending {
-		q.mu.Unlock()
-		return false
-	}
-	q.submitPending++
-	q.mu.Unlock()
-
-	accepted := q.pushJob(func() {
-		defer q.releaseSubmitted()
-		job()
-	})
-	if !accepted {
-		q.releaseSubmitted()
-	}
-	return accepted
+	return q.submitJob(job)
 }
 
 // SubmitBatch submits as many legacy jobs as the pending limit allows and
 // returns the number accepted. Nil jobs are ignored, matching Submit.
 func (q *Queue) SubmitBatch(jobs []Job) int {
-	jobs = compactJobs(jobs)
-	if q.opt.maxPending <= 0 {
-		return q.pushBatch(jobs)
-	}
-	accepted := 0
-	for _, job := range jobs {
-		if !q.Submit(job) {
-			break
-		}
-		accepted++
-	}
+	accepted, _ := q.submitBatch(jobs, false)
 	return accepted
 }
 
@@ -119,22 +94,32 @@ func (q *Queue) SubmitBatch(jobs []Job) int {
 // ignored, matching Submit. It returns false without admitting any job when
 // the queue is stopped or the pending limit cannot hold the batch.
 func (q *Queue) TrySubmitBatch(jobs []Job) bool {
+	_, accepted := q.submitBatch(jobs, true)
+	return accepted
+}
+
+func (q *Queue) submitBatch(jobs []Job, atomicBatch bool) (accepted int, allAccepted bool) {
 	jobs = compactJobs(jobs)
 	q.mu.Lock()
 	if q.stopped {
 		q.mu.Unlock()
-		return false
+		return 0, false
 	}
+	accepted = len(jobs)
 	if q.opt.maxPending > 0 {
-		if q.opt.maxPending-q.submitPending < len(jobs) {
+		available := q.opt.maxPending - int(atomic.LoadInt64(&q.submitPending))
+		if atomicBatch && available < accepted {
 			q.mu.Unlock()
-			return false
+			return 0, false
 		}
-		q.submitPending += len(jobs)
+		if available < accepted {
+			accepted = available
+		}
+		atomic.AddInt64(&q.submitPending, int64(accepted))
 	}
 
-	actions := make([]legacyDispatch, 0, q.dispatchCapacity(len(jobs)))
-	for _, job := range jobs {
+	actions := make([]legacyDispatch, 0, q.dispatchCapacity(accepted))
+	for _, job := range jobs[:accepted] {
 		if q.opt.maxPending > 0 {
 			original := job
 			job = func() {
@@ -146,7 +131,7 @@ func (q *Queue) TrySubmitBatch(jobs []Job) bool {
 	}
 	q.mu.Unlock()
 	q.dispatch(actions)
-	return true
+	return accepted, accepted == len(jobs)
 }
 
 // Len returns the number of tasks queued but not yet started.
@@ -198,24 +183,52 @@ func (q *Queue) pushJob(job Job) bool {
 		q.mu.Unlock()
 		return false
 	}
+	w, spawn := q.enqueueSingleLocked(job)
+	q.mu.Unlock()
+	if w != nil {
+		w.ch <- job
+	} else if spawn {
+		q.spawn(q.acquire(), job)
+	}
+	return true
+}
+
+func (q *Queue) submitJob(job Job) bool {
+	q.mu.Lock()
+	if q.stopped || atomic.LoadInt64(&q.submitPending) >= int64(q.opt.maxPending) {
+		q.mu.Unlock()
+		return false
+	}
+	atomic.AddInt64(&q.submitPending, 1)
+	original := job
+	job = func() {
+		defer q.releaseSubmitted()
+		original()
+	}
+	w, spawn := q.enqueueSingleLocked(job)
+	q.mu.Unlock()
+	if w != nil {
+		w.ch <- job
+	} else if spawn {
+		q.spawn(q.acquire(), job)
+	}
+	return true
+}
+
+func (q *Queue) enqueueSingleLocked(job Job) (*legacyWorker, bool) {
 	if k := len(q.idle); k > 0 {
 		w := q.idle[k-1]
 		q.idle[k-1] = nil
 		q.idle = q.idle[:k-1]
 		q.running++
-		q.mu.Unlock()
-		w.ch <- job
-		return true
+		return w, false
 	}
 	if q.running < q.opt.concurrency {
 		q.running++
-		q.mu.Unlock()
-		q.spawn(q.acquire(), job)
-		return true
+		return nil, true
 	}
 	q.backlog.push(job)
-	q.mu.Unlock()
-	return true
+	return nil, false
 }
 
 type legacyDispatch struct {
@@ -295,9 +308,7 @@ func compactJobs(jobs []Job) []Job {
 }
 
 func (q *Queue) releaseSubmitted() {
-	q.mu.Lock()
-	q.submitPending--
-	q.mu.Unlock()
+	atomic.AddInt64(&q.submitPending, -1)
 }
 
 func (q *Queue) finished() bool {

@@ -28,6 +28,7 @@ package taskgo
 import (
 	"context"
 	"sync"
+	"sync/atomic"
 	"time"
 )
 
@@ -113,6 +114,7 @@ type worker[T any] struct {
 // taskQueue contains the scheduling implementation shared by Queue and Task.
 // run is bound once at construction and is called directly with each queued T.
 type taskQueue[T any] struct {
+	submitPending  int64 // atomically released by workers; admission is serialized by mu
 	mu             sync.Mutex
 	opt            *options
 	backlog        *taskRing[T]
@@ -123,7 +125,6 @@ type taskQueue[T any] struct {
 	janitorRunning bool
 
 	onSpawnForTest func()
-	submitPending  int
 	run            func(T)
 }
 
@@ -162,20 +163,7 @@ func (q *taskQueue[T]) submit(value T) bool {
 	if q.opt.maxPending <= 0 {
 		return q.push(value)
 	}
-
-	q.mu.Lock()
-	if q.stopped || q.submitPending >= q.opt.maxPending {
-		q.mu.Unlock()
-		return false
-	}
-	q.submitPending++
-	q.mu.Unlock()
-
-	accepted := q.pushItem(taskItem[T]{value: value, submitted: true})
-	if !accepted {
-		q.releaseSubmitted()
-	}
-	return accepted
+	return q.submitItem(value)
 }
 
 func (q *taskQueue[T]) submitBatch(values []T, atomicBatch bool) (accepted int, allAccepted bool) {
@@ -191,7 +179,7 @@ func (q *taskQueue[T]) submitBatch(values []T, atomicBatch bool) (accepted int, 
 
 	accepted = len(values)
 	if q.opt.maxPending > 0 {
-		available := q.opt.maxPending - q.submitPending
+		available := q.opt.maxPending - int(atomic.LoadInt64(&q.submitPending))
 		if atomicBatch && available < accepted {
 			q.mu.Unlock()
 			return 0, false
@@ -203,7 +191,7 @@ func (q *taskQueue[T]) submitBatch(values []T, atomicBatch bool) (accepted int, 
 			q.mu.Unlock()
 			return 0, false
 		}
-		q.submitPending += accepted
+		atomic.AddInt64(&q.submitPending, int64(accepted))
 	}
 
 	submitted := q.opt.maxPending > 0
@@ -222,6 +210,35 @@ func (q *taskQueue[T]) pushItem(item taskItem[T]) bool {
 		q.mu.Unlock()
 		return false
 	}
+	w, spawn := q.enqueueSingleLocked(item)
+	q.mu.Unlock()
+	if w != nil {
+		w.ch <- taskMessage[T]{item: item}
+	} else if spawn {
+		q.spawn(q.acquire(), item.value, item.submitted)
+	}
+	return true
+}
+
+func (q *taskQueue[T]) submitItem(value T) bool {
+	q.mu.Lock()
+	if q.stopped || atomic.LoadInt64(&q.submitPending) >= int64(q.opt.maxPending) {
+		q.mu.Unlock()
+		return false
+	}
+	atomic.AddInt64(&q.submitPending, 1)
+	item := taskItem[T]{value: value, submitted: true}
+	w, spawn := q.enqueueSingleLocked(item)
+	q.mu.Unlock()
+	if w != nil {
+		w.ch <- taskMessage[T]{item: item}
+	} else if spawn {
+		q.spawn(q.acquire(), value, true)
+	}
+	return true
+}
+
+func (q *taskQueue[T]) enqueueSingleLocked(item taskItem[T]) (*worker[T], bool) {
 	// Keep the single-item path allocation-free. The batch path collects
 	// dispatch actions, but Push and Submit are hot enough that an action slice
 	// here would escape once passed to dispatchBatch.
@@ -230,19 +247,14 @@ func (q *taskQueue[T]) pushItem(item taskItem[T]) bool {
 		q.idle[k-1] = nil
 		q.idle = q.idle[:k-1]
 		q.running++
-		q.mu.Unlock()
-		w.ch <- taskMessage[T]{item: item}
-		return true
+		return w, false
 	}
 	if q.running < q.opt.concurrency {
 		q.running++
-		q.mu.Unlock()
-		q.spawn(q.acquire(), item.value, item.submitted)
-		return true
+		return nil, true
 	}
 	q.backlog.push(item)
-	q.mu.Unlock()
-	return true
+	return nil, false
 }
 
 func (q *taskQueue[T]) enqueueItemLocked(item taskItem[T], actions *[]taskDispatch[T]) {
@@ -431,9 +443,7 @@ func (q *taskQueue[T]) release(w *worker[T]) {
 }
 
 func (q *taskQueue[T]) releaseSubmitted() {
-	q.mu.Lock()
-	q.submitPending--
-	q.mu.Unlock()
+	atomic.AddInt64(&q.submitPending, -1)
 }
 
 func (q *taskQueue[T]) ensureJanitorLocked() {
