@@ -46,6 +46,22 @@ func (r *taskRing[T]) push(item taskItem[T]) {
 	r.n++
 }
 
+func (r *taskRing[T]) reserve(additional int) {
+	if additional <= 0 || additional <= len(r.buf)-r.n {
+		return
+	}
+	needed := r.n + additional
+	capacity := len(r.buf)
+	for capacity < needed {
+		if capacity > needed/2 {
+			capacity = needed
+			break
+		}
+		capacity *= 2
+	}
+	r.growTo(capacity)
+}
+
 func (r *taskRing[T]) pop() (taskItem[T], bool) {
 	if r.n == 0 {
 		return taskItem[T]{}, false
@@ -61,7 +77,11 @@ func (r *taskRing[T]) pop() (taskItem[T], bool) {
 }
 
 func (r *taskRing[T]) grow() {
-	nbuf := make([]taskItem[T], len(r.buf)*2)
+	r.growTo(len(r.buf) * 2)
+}
+
+func (r *taskRing[T]) growTo(capacity int) {
+	nbuf := make([]taskItem[T], capacity)
 	for i := 0; i < r.n; i++ {
 		nbuf[i] = r.buf[(r.head+i)%len(r.buf)]
 	}

@@ -49,6 +49,24 @@ func (r *ring) push(j Job) {
 	r.n++
 }
 
+// reserve ensures room for additional jobs without changing their order.
+// Callers hold Queue.mu, so one batch can grow the ring at most once.
+func (r *ring) reserve(additional int) {
+	if additional <= 0 || additional <= len(r.buf)-r.n {
+		return
+	}
+	needed := r.n + additional
+	capacity := len(r.buf)
+	for capacity < needed {
+		if capacity > needed/2 {
+			capacity = needed
+			break
+		}
+		capacity *= 2
+	}
+	r.growTo(capacity)
+}
+
 // pop removes and returns the oldest job. The second result is false when the
 // ring is empty.
 func (r *ring) pop() (Job, bool) {
@@ -67,7 +85,11 @@ func (r *ring) pop() (Job, bool) {
 
 // grow doubles the buffer, re-laying the jobs out from index 0.
 func (r *ring) grow() {
-	nbuf := make([]Job, len(r.buf)*2)
+	r.growTo(len(r.buf) * 2)
+}
+
+func (r *ring) growTo(capacity int) {
+	nbuf := make([]Job, capacity)
 	for i := 0; i < r.n; i++ {
 		nbuf[i] = r.buf[(r.head+i)%len(r.buf)]
 	}

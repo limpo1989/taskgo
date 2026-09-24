@@ -184,6 +184,35 @@ func TestBacklogLen(t *testing.T) {
 	_ = q.Stop(context.Background())
 }
 
+func TestBacklogLenIncludesPrefetchedTasks(t *testing.T) {
+	q := New(WithConcurrency(1))
+	initialStarted := make(chan struct{})
+	releaseInitial := make(chan struct{})
+	q.Push(func() {
+		close(initialStarted)
+		<-releaseInitial
+	})
+	<-initialStarted
+
+	prefetchedStarted := make(chan struct{})
+	releasePrefetched := make(chan struct{})
+	q.Push(func() {
+		close(prefetchedStarted)
+		<-releasePrefetched
+	})
+	for i := 1; i < workerBatchSize; i++ {
+		q.Push(func() {})
+	}
+
+	close(releaseInitial)
+	<-prefetchedStarted
+	waitFor(t, time.Second, func() bool { return q.Len() == workerBatchSize-1 })
+	close(releasePrefetched)
+	if err := q.Stop(context.Background()); err != nil {
+		t.Fatalf("stop: %v", err)
+	}
+}
+
 // ---------- worker reuse / parking ----------
 
 func TestWorkerReuseWhenIdleEnabled(t *testing.T) {

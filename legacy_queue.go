@@ -35,25 +35,24 @@ type legacyWorker struct {
 //
 // The zero value is not usable; create one with New.
 type Queue struct {
-	submitPending     int64 // atomically released by workers; admission is serialized by mu
-	runningAtomic     int64
-	shardCursor       uint64
-	popCursor         uint64
-	stoppedAtomic     int32
-	mu                sync.Mutex
-	opt               *options
-	backlog           *ring
-	shards            []jobShard
-	wake              chan struct{}
-	dispatchWake      chan struct{}
-	dispatchStop      chan struct{}
-	dispatcherStarted int32
-	ingress           sync.RWMutex
-	idle              []*legacyWorker
-	pool              sync.Pool
-	running           int
-	stopped           bool
-	janitorRunning    bool
+	submitPending      int64 // atomically released by workers; admission is serialized by mu
+	backlogAtomic      int64
+	prefetchedAtomic   int64
+	completedAtomic    int64
+	spillLastCompleted int64
+	spillCheckNano     int64
+	workerTarget       int64
+	initialWorkers     int64
+	taskEWMA           int64
+	mu                 sync.Mutex
+	opt                *options
+	backlog            *ring
+	idle               []*legacyWorker
+	pool               sync.Pool
+	running            int
+	stopped            bool
+	janitorRunning     bool
+	stallMonitor       bool
 
 	onSpawnForTest func()
 }
@@ -61,14 +60,108 @@ type Queue struct {
 // New creates a legacy no-argument task queue configured by opts.
 func New(opts ...Option) *Queue {
 	o := newOptions(opts)
-	q := &Queue{opt: o, backlog: newRing(8)}
-	if o.shards > 1 {
-		q.shards = newJobShards(o.shards)
-		q.wake = make(chan struct{}, o.concurrency)
-		q.dispatchWake = make(chan struct{}, 1)
-		q.dispatchStop = make(chan struct{})
+	target := autoWorkerLimit(o.concurrency)
+	return &Queue{opt: o, backlog: newRing(backlogCapacityHint(target)), workerTarget: int64(target), initialWorkers: int64(target)}
+}
+
+func (q *Queue) workerLimit() int { return int(atomic.LoadInt64(&q.workerTarget)) }
+
+func (q *Queue) observeTask(d time.Duration) {
+	ns := d.Nanoseconds()
+	old := atomic.LoadInt64(&q.taskEWMA)
+	if old == 0 {
+		atomic.StoreInt64(&q.taskEWMA, ns)
+	} else {
+		atomic.StoreInt64(&q.taskEWMA, old+(ns-old)/8)
 	}
-	return q
+	if ns < int64(250*time.Microsecond) || atomic.LoadInt64(&q.backlogAtomic) == 0 {
+		return
+	}
+	for {
+		oldTarget := atomic.LoadInt64(&q.workerTarget)
+		if oldTarget >= int64(q.opt.concurrency) {
+			return
+		}
+		step := oldTarget / 4
+		if step < 1 {
+			step = 1
+		}
+		newTarget := oldTarget + step
+		if newTarget > int64(q.opt.concurrency) {
+			newTarget = int64(q.opt.concurrency)
+		}
+		if atomic.CompareAndSwapInt64(&q.workerTarget, oldTarget, newTarget) {
+			return
+		}
+	}
+}
+
+func (q *Queue) retireWorker() {
+	for {
+		old := atomic.LoadInt64(&q.workerTarget)
+		if old <= q.initialWorkers {
+			return
+		}
+		if atomic.CompareAndSwapInt64(&q.workerTarget, old, old-1) {
+			return
+		}
+	}
+}
+
+func (q *Queue) maybeSpillLocked(now time.Time) {
+	if q.stopped || q.backlog.len() == 0 || q.running < q.workerLimit() {
+		return
+	}
+	completed := atomic.LoadInt64(&q.completedAtomic)
+	if q.spillCheckNano == 0 || completed != q.spillLastCompleted {
+		q.spillLastCompleted = completed
+		q.spillCheckNano = now.UnixNano()
+		return
+	}
+	if now.UnixNano()-q.spillCheckNano < int64(workerStallThreshold) {
+		return
+	}
+	target := q.workerLimit()
+	if target >= q.opt.concurrency {
+		return
+	}
+	step := target / 4
+	if step < 1 {
+		step = 1
+	}
+	if q.backlog.len() > target {
+		step = target
+	}
+	newTarget := target + step
+	if newTarget > q.opt.concurrency {
+		newTarget = q.opt.concurrency
+	}
+	atomic.StoreInt64(&q.workerTarget, int64(newTarget))
+	q.spillLastCompleted = completed
+	q.spillCheckNano = now.UnixNano()
+	for q.running < newTarget {
+		next, ok := q.popBacklogLocked()
+		if !ok {
+			return
+		}
+		q.running++
+		q.spawn(q.acquire(), next)
+	}
+}
+
+func (q *Queue) stallLoop() {
+	ticker := time.NewTicker(workerStallThreshold)
+	defer ticker.Stop()
+	for range ticker.C {
+		q.mu.Lock()
+		if q.stopped || q.backlog.len() == 0 || q.workerLimit() >= q.opt.concurrency {
+			q.stallMonitor = false
+			q.mu.Unlock()
+			return
+		}
+		q.maybeSpillLocked(time.Now())
+		q.mu.Unlock()
+	}
 }
 
 // Push submits a task. It runs immediately if a worker is available, otherwise
@@ -117,20 +210,30 @@ func (q *Queue) TrySubmitBatch(jobs []Job) bool {
 
 func (q *Queue) submitBatch(jobs []Job, atomicBatch bool) (accepted int, allAccepted bool) {
 	jobs = compactJobs(jobs)
-	if len(jobs) == 0 {
-		q.mu.Lock()
-		stopped := q.stopped
+	q.mu.Lock()
+	if q.stopped {
 		q.mu.Unlock()
-		return 0, !stopped
-	}
-	accepted, ok := q.reservePendingBatch(len(jobs), atomicBatch)
-	if !ok {
 		return 0, false
 	}
-	submitted := q.opt.maxPending > 0
-	if len(q.shards) > 1 && atomic.LoadInt32(&q.stoppedAtomic) == 0 &&
-		atomic.LoadInt64(&q.runningAtomic) >= int64(q.opt.concurrency) {
-		admitted := 0
+	accepted = len(jobs)
+	if q.opt.maxPending > 0 {
+		available := q.opt.maxPending - int(atomic.LoadInt64(&q.submitPending))
+		if atomicBatch && available < accepted {
+			q.mu.Unlock()
+			return 0, false
+		}
+		if available < accepted {
+			accepted = available
+		}
+		if accepted == 0 {
+			q.mu.Unlock()
+			return 0, false
+		}
+		atomic.AddInt64(&q.submitPending, int64(accepted))
+	}
+	if atomicBatch {
+		submitted := q.opt.maxPending > 0
+		q.backlog.reserve(accepted)
 		for _, job := range jobs[:accepted] {
 			if submitted {
 				original := job
@@ -139,39 +242,38 @@ func (q *Queue) submitBatch(jobs []Job, atomicBatch bool) (accepted int, allAcce
 					original()
 				}
 			}
-			if !q.enqueueSharded(job) {
-				break
+			w, spawn := q.enqueueSingleLocked(job)
+			if w != nil {
+				w.ch <- job
+			} else if spawn {
+				q.spawn(q.acquire(), job)
 			}
-			admitted++
 		}
-		if submitted && admitted < accepted {
-			atomic.AddInt64(&q.submitPending, -int64(accepted-admitted))
-		}
-		return admitted, admitted == len(jobs)
-	}
-
-	q.mu.Lock()
-	if q.stopped {
 		q.mu.Unlock()
-		if submitted {
-			atomic.AddInt64(&q.submitPending, -int64(accepted))
-		}
-		return 0, false
+		return accepted, true
 	}
-	actions := make([]legacyDispatch, 0, q.dispatchCapacity(accepted))
+	q.backlog.reserve(accepted)
+	q.mu.Unlock()
+
+	submitted := q.opt.maxPending > 0
+	admitted := 0
 	for _, job := range jobs[:accepted] {
-		if submitted {
+		if q.opt.maxPending > 0 {
 			original := job
 			job = func() {
 				defer q.releaseSubmitted()
 				original()
 			}
 		}
-		q.enqueueLocked(job, &actions)
+		if !q.enqueueReservedJob(job) {
+			break
+		}
+		admitted++
 	}
-	q.mu.Unlock()
-	q.dispatch(actions)
-	return accepted, accepted == len(jobs)
+	if submitted && admitted < accepted {
+		atomic.AddInt64(&q.submitPending, -int64(accepted-admitted))
+	}
+	return admitted, admitted == len(jobs)
 }
 
 // Len returns the number of tasks queued but not yet started.
@@ -179,30 +281,20 @@ func (q *Queue) Len() int {
 	q.mu.Lock()
 	length := q.backlog.len()
 	q.mu.Unlock()
-	for i := range q.shards {
-		length += q.shards[i].len()
-	}
-	return length
+	return length + int(atomic.LoadInt64(&q.prefetchedAtomic))
 }
 
 // Stop shuts the queue down and waits for outstanding tasks to finish.
 func (q *Queue) Stop(ctx context.Context) error {
-	q.ingress.Lock()
 	q.mu.Lock()
 	if q.stopped {
 		q.mu.Unlock()
-		q.ingress.Unlock()
 		return nil
 	}
 	q.stopped = true
-	atomic.StoreInt32(&q.stoppedAtomic, 1)
 	idle := q.idle
 	q.idle = nil
-	if q.dispatchStop != nil {
-		close(q.dispatchStop)
-	}
 	q.mu.Unlock()
-	q.ingress.Unlock()
 
 	for _, w := range idle {
 		w.ch <- nil
@@ -229,13 +321,6 @@ func (q *Queue) Stop(ctx context.Context) error {
 }
 
 func (q *Queue) pushJob(job Job) bool {
-	if len(q.shards) > 1 && atomic.LoadInt32(&q.stoppedAtomic) == 0 &&
-		atomic.LoadInt64(&q.runningAtomic) >= int64(q.opt.concurrency) {
-		if !q.enqueueSharded(job) {
-			return false
-		}
-		return true
-	}
 	q.mu.Lock()
 	if q.stopped {
 		q.mu.Unlock()
@@ -251,135 +336,18 @@ func (q *Queue) pushJob(job Job) bool {
 	return true
 }
 
-func (q *Queue) enqueueSharded(job Job) bool {
-	q.ingress.RLock()
-	defer q.ingress.RUnlock()
-	if atomic.LoadInt32(&q.stoppedAtomic) != 0 {
-		return false
-	}
-	s := q.pickJobShard()
-	if s.push(job) {
-		q.signalDispatcher()
-	}
-	return true
-}
-
-func (q *Queue) signalDispatcher() {
-	if atomic.LoadInt32(&q.stoppedAtomic) != 0 {
-		return
-	}
-	if atomic.CompareAndSwapInt32(&q.dispatcherStarted, 0, 1) {
-		go q.shardedDispatcher()
-	}
-	select {
-	case q.dispatchWake <- struct{}{}:
-	default:
-	}
-}
-
-func (q *Queue) shardedDispatcher() {
-	for {
-		select {
-		case <-q.dispatchWake:
-			q.replenishSharded()
-		case <-q.dispatchStop:
-			return
-		}
-	}
-}
-
-func (q *Queue) replenishSharded() {
-	q.mu.Lock()
-	if q.stopped {
-		q.mu.Unlock()
-		return
-	}
-	var spawns []legacyDispatch
-	for q.running < q.opt.concurrency {
-		next, ok := q.popSharded()
-		if !ok {
-			break
-		}
-		if k := len(q.idle); k > 0 {
-			w := q.idle[k-1]
-			q.idle[k-1] = nil
-			q.idle = q.idle[:k-1]
-			q.running++
-			atomic.AddInt64(&q.runningAtomic, 1)
-			w.ch <- next
-			continue
-		}
-		q.running++
-		atomic.AddInt64(&q.runningAtomic, 1)
-		spawns = append(spawns, legacyDispatch{job: next})
-	}
-	q.mu.Unlock()
-	for _, action := range spawns {
-		q.spawn(q.acquire(), action.job)
-	}
-}
-
-func (q *Queue) pickJobShard() *jobShard {
-	n := uint64(len(q.shards))
-	a := atomic.AddUint64(&q.shardCursor, 1) % n
-	b := (a*6364136223846793005 + 1442695040888963407) % n
-	if b == a {
-		b = (b + 1) % n
-	}
-	if q.shards[b].len() < q.shards[a].len() {
-		a = b
-	}
-	return &q.shards[a]
-}
-
-func (q *Queue) popSharded() (Job, bool) {
-	n := uint64(len(q.shards))
-	start := atomic.AddUint64(&q.popCursor, 1) % n
-	for i := uint64(0); i < n; i++ {
-		if job, ok := q.shards[(start+i)%n].pop(); ok {
-			return job, true
-		}
-	}
-	return nil, false
-}
-
-func (q *Queue) removeIdleLocked(w *legacyWorker) bool {
-	for i, candidate := range q.idle {
-		if candidate != w {
-			continue
-		}
-		last := len(q.idle) - 1
-		q.idle[i] = q.idle[last]
-		q.idle[last] = nil
-		q.idle = q.idle[:last]
-		return true
-	}
-	return false
-}
-
 func (q *Queue) submitJob(job Job) bool {
-	if !q.reservePending(1) {
+	q.mu.Lock()
+	if q.stopped || atomic.LoadInt64(&q.submitPending) >= int64(q.opt.maxPending) {
+		q.mu.Unlock()
 		return false
 	}
+	atomic.AddInt64(&q.submitPending, 1)
 	original := job
 	job = func() {
 		defer q.releaseSubmitted()
 		original()
 	}
-	if len(q.shards) > 1 && atomic.LoadInt32(&q.stoppedAtomic) == 0 &&
-		atomic.LoadInt64(&q.runningAtomic) >= int64(q.opt.concurrency) {
-		if !q.enqueueSharded(job) {
-			q.releaseSubmitted()
-			return false
-		}
-		return true
-	}
-	q.mu.Lock()
-	if q.stopped {
-		q.mu.Unlock()
-		q.releaseSubmitted()
-		return false
-	}
 	w, spawn := q.enqueueSingleLocked(job)
 	q.mu.Unlock()
 	if w != nil {
@@ -390,35 +358,20 @@ func (q *Queue) submitJob(job Job) bool {
 	return true
 }
 
-func (q *Queue) reservePending(n int) bool {
-	_, ok := q.reservePendingBatch(n, true)
-	return ok
-}
-
-func (q *Queue) reservePendingBatch(n int, atomicBatch bool) (int, bool) {
-	if atomic.LoadInt32(&q.stoppedAtomic) != 0 {
-		return 0, false
+func (q *Queue) enqueueReservedJob(job Job) bool {
+	q.mu.Lock()
+	if q.stopped {
+		q.mu.Unlock()
+		return false
 	}
-	if q.opt.maxPending <= 0 {
-		return n, true
+	w, spawn := q.enqueueSingleLocked(job)
+	q.mu.Unlock()
+	if w != nil {
+		w.ch <- job
+	} else if spawn {
+		q.spawn(q.acquire(), job)
 	}
-	for {
-		current := atomic.LoadInt64(&q.submitPending)
-		available := int64(q.opt.maxPending) - current
-		accepted := int64(n)
-		if available < accepted {
-			if atomicBatch {
-				return 0, false
-			}
-			accepted = available
-		}
-		if accepted <= 0 {
-			return 0, false
-		}
-		if atomic.CompareAndSwapInt64(&q.submitPending, current, current+accepted) {
-			return int(accepted), true
-		}
-	}
+	return true
 }
 
 func (q *Queue) enqueueSingleLocked(job Job) (*legacyWorker, bool) {
@@ -427,94 +380,53 @@ func (q *Queue) enqueueSingleLocked(job Job) (*legacyWorker, bool) {
 		q.idle[k-1] = nil
 		q.idle = q.idle[:k-1]
 		q.running++
-		if len(q.shards) > 1 {
-			atomic.AddInt64(&q.runningAtomic, 1)
-		}
 		return w, false
 	}
-	if q.running < q.opt.concurrency {
+	if q.running < q.workerLimit() {
 		q.running++
-		if len(q.shards) > 1 {
-			atomic.AddInt64(&q.runningAtomic, 1)
-		}
 		return nil, true
 	}
-	q.backlog.push(job)
+	q.pushBacklogLocked(job)
 	return nil, false
-}
-
-type legacyDispatch struct {
-	worker *legacyWorker
-	job    Job
 }
 
 func (q *Queue) pushBatch(jobs []Job) int {
 	if len(jobs) == 0 {
 		return 0
 	}
-	if len(q.shards) > 1 && atomic.LoadInt32(&q.stoppedAtomic) == 0 &&
-		atomic.LoadInt64(&q.runningAtomic) >= int64(q.opt.concurrency) {
-		accepted := 0
-		for _, job := range jobs {
-			if !q.enqueueSharded(job) {
-				break
-			}
-			accepted++
-		}
-		return accepted
-	}
-	q.mu.Lock()
-	if q.stopped {
-		q.mu.Unlock()
-		return 0
-	}
-	actions := make([]legacyDispatch, 0, q.dispatchCapacity(len(jobs)))
+	accepted := 0
 	for _, job := range jobs {
-		q.enqueueLocked(job, &actions)
+		if !q.pushJob(job) {
+			break
+		}
+		accepted++
 	}
-	q.mu.Unlock()
-	q.dispatch(actions)
-	return len(jobs)
+	return accepted
 }
 
-func (q *Queue) enqueueLocked(job Job, actions *[]legacyDispatch) {
-	if k := len(q.idle); k > 0 {
-		w := q.idle[k-1]
-		q.idle[k-1] = nil
-		q.idle = q.idle[:k-1]
-		q.running++
-		if len(q.shards) > 1 {
-			atomic.AddInt64(&q.runningAtomic, 1)
-		}
-		*actions = append(*actions, legacyDispatch{worker: w, job: job})
-		return
-	}
-	if q.running < q.opt.concurrency {
-		q.running++
-		if len(q.shards) > 1 {
-			atomic.AddInt64(&q.runningAtomic, 1)
-		}
-		*actions = append(*actions, legacyDispatch{job: job})
-		return
-	}
+func (q *Queue) pushBacklogLocked(job Job) {
+	wasEmpty := q.backlog.len() == 0
 	q.backlog.push(job)
-}
-
-func (q *Queue) dispatchCapacity(n int) int {
-	if n > q.opt.concurrency {
-		return q.opt.concurrency
-	}
-	return n
-}
-
-func (q *Queue) dispatch(actions []legacyDispatch) {
-	for _, action := range actions {
-		if action.worker != nil {
-			action.worker.ch <- action.job
-		} else {
-			q.spawn(q.acquire(), action.job)
+	atomic.AddInt64(&q.backlogAtomic, 1)
+	if wasEmpty {
+		q.spillLastCompleted = atomic.LoadInt64(&q.completedAtomic)
+		q.spillCheckNano = time.Now().UnixNano()
+		if !q.stallMonitor {
+			q.stallMonitor = true
+			go q.stallLoop()
 		}
 	}
+}
+
+func (q *Queue) popBacklogLocked() (Job, bool) {
+	job, ok := q.backlog.pop()
+	if ok {
+		atomic.AddInt64(&q.backlogAtomic, -1)
+		if q.backlog.len() == 0 {
+			q.spillCheckNano = 0
+		}
+	}
+	return job, ok
 }
 
 func compactJobs(jobs []Job) []Job {
@@ -542,57 +454,78 @@ func (q *Queue) releaseSubmitted() {
 
 func (q *Queue) finished() bool {
 	q.mu.Lock()
-	finished := q.backlog.len()+q.running == 0
-	q.mu.Unlock()
-	if !finished {
-		return false
-	}
-	for i := range q.shards {
-		if q.shards[i].len() != 0 {
-			return false
-		}
-	}
-	return true
+	defer q.mu.Unlock()
+	return q.backlog.len()+q.running == 0
 }
 
 func (q *Queue) worker(w *legacyWorker, job Job) {
-	if len(q.shards) > 1 {
-		q.workerSharded(w, job)
-		return
-	}
 	n := 0
+	var batch [workerBatchSize]Job
+	batchN, batchI := 0, 0
+	fromBatch := false
 	for {
+		if fromBatch {
+			atomic.AddInt64(&q.prefetchedAtomic, -1)
+			fromBatch = false
+		}
+		var taskStart time.Time
+		if n&63 == 0 {
+			taskStart = time.Now()
+		}
 		q.exec(job)
+		atomic.AddInt64(&q.completedAtomic, 1)
+		if !taskStart.IsZero() {
+			q.observeTask(time.Since(taskStart))
+		}
 		n++
 		capReached := q.opt.maxJobs > 0 && n >= q.opt.maxJobs
+		if batchI < batchN {
+			job = batch[batchI]
+			batch[batchI] = nil
+			batchI++
+			fromBatch = true
+			continue
+		}
+		batchN, batchI = 0, 0
 
 		q.mu.Lock()
-		if next, ok := q.backlog.pop(); ok {
-			if capReached && atomic.LoadInt32(&q.stoppedAtomic) == 0 {
+		if next, ok := q.popBacklogLocked(); ok {
+			if capReached && !q.stopped {
 				q.mu.Unlock()
 				q.spawn(q.acquire(), next)
 				q.release(w)
 				return
 			}
+			batch[0] = next
+			batchN = 1
+			limit := workerBatchSize
+			if q.opt.maxJobs > 0 && q.opt.maxJobs-n < limit {
+				limit = q.opt.maxJobs - n
+			}
+			for batchN < limit {
+				next, ok := q.popBacklogLocked()
+				if !ok {
+					break
+				}
+				batch[batchN] = next
+				batchN++
+			}
+			atomic.AddInt64(&q.prefetchedAtomic, int64(batchN-1))
 			q.mu.Unlock()
-			job = next
+			job = batch[0]
+			batch[0] = nil
+			batchI = 1
 			continue
 		}
 
 		if q.stopped || capReached || q.opt.maxIdle <= 0 {
 			q.running--
-			if len(q.shards) > 1 {
-				atomic.AddInt64(&q.runningAtomic, -1)
-			}
 			q.mu.Unlock()
 			q.release(w)
 			return
 		}
 
 		q.running--
-		if len(q.shards) > 1 {
-			atomic.AddInt64(&q.runningAtomic, -1)
-		}
 		w.lastUsed = q.opt.nowFn()
 		q.idle = append(q.idle, w)
 		q.ensureJanitorLocked()
@@ -604,130 +537,6 @@ func (q *Queue) worker(w *legacyWorker, job Job) {
 			return
 		}
 		n = 0
-	}
-}
-
-func (q *Queue) workerSharded(w *legacyWorker, job Job) {
-	n := 0
-	for {
-		q.exec(job)
-		n++
-		capReached := q.opt.maxJobs > 0 && n >= q.opt.maxJobs
-		if n&15 == 0 {
-			q.mu.Lock()
-			if next, ok := q.backlog.pop(); ok {
-				if capReached && !q.stopped {
-					q.mu.Unlock()
-					q.spawn(q.acquire(), next)
-					q.release(w)
-					return
-				}
-				q.mu.Unlock()
-				job = next
-				continue
-			}
-			q.mu.Unlock()
-		}
-
-		if next, ok := q.popSharded(); ok {
-			if capReached && atomic.LoadInt32(&q.stoppedAtomic) == 0 {
-				q.spawn(q.acquire(), next)
-				q.release(w)
-				return
-			}
-			job = next
-			continue
-		}
-
-		q.mu.Lock()
-		if next, ok := q.backlog.pop(); ok {
-			if capReached && !q.stopped {
-				q.mu.Unlock()
-				q.spawn(q.acquire(), next)
-				q.release(w)
-				return
-			}
-			q.mu.Unlock()
-			job = next
-			continue
-		}
-		if next, ok := q.popSharded(); ok {
-			if capReached && atomic.LoadInt32(&q.stoppedAtomic) == 0 {
-				q.mu.Unlock()
-				q.spawn(q.acquire(), next)
-				q.release(w)
-				return
-			}
-			q.mu.Unlock()
-			job = next
-			continue
-		}
-
-		if q.stopped || capReached || q.opt.maxIdle <= 0 {
-			q.signalDispatcher()
-			q.running--
-			atomic.AddInt64(&q.runningAtomic, -1)
-			q.mu.Unlock()
-			q.release(w)
-			return
-		}
-
-		q.running--
-		atomic.AddInt64(&q.runningAtomic, -1)
-		w.lastUsed = q.opt.nowFn()
-		q.idle = append(q.idle, w)
-		q.ensureJanitorLocked()
-		q.mu.Unlock()
-
-		for {
-			select {
-			case next := <-w.ch:
-				if next == nil {
-					q.release(w)
-					return
-				}
-				job = next
-				n = 0
-				goto nextTask
-			case <-q.wake:
-				q.mu.Lock()
-				if !q.removeIdleLocked(w) {
-					q.mu.Unlock()
-					continue
-				}
-				q.running++
-				atomic.AddInt64(&q.runningAtomic, 1)
-				q.mu.Unlock()
-				if next, ok := q.popSharded(); ok {
-					job = next
-					n = 0
-					goto nextTask
-				}
-				q.mu.Lock()
-				if next, ok := q.backlog.pop(); ok {
-					q.mu.Unlock()
-					job = next
-					n = 0
-					goto nextTask
-				}
-				q.mu.Unlock()
-				q.mu.Lock()
-				if q.stopped {
-					q.running--
-					atomic.AddInt64(&q.runningAtomic, -1)
-					q.mu.Unlock()
-					q.release(w)
-					return
-				}
-				q.running--
-				atomic.AddInt64(&q.runningAtomic, -1)
-				w.lastUsed = q.opt.nowFn()
-				q.idle = append(q.idle, w)
-				q.ensureJanitorLocked()
-				q.mu.Unlock()
-			}
-		}
-	nextTask:
 	}
 }
 
@@ -757,6 +566,7 @@ func (q *Queue) spawn(w *legacyWorker, job Job) {
 }
 
 func (q *Queue) release(w *legacyWorker) {
+	q.retireWorker()
 	w.lastUsed = time.Time{}
 	q.pool.Put(w)
 }

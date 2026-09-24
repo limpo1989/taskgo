@@ -58,3 +58,32 @@ func TestNewRingMinCapacity(t *testing.T) {
 		t.Fatalf("cap = %d, want 1", len(r.buf))
 	}
 }
+
+func TestRingReservePreservesFIFO(t *testing.T) {
+	r := newRing(4)
+	var order []int
+	for i := 0; i < 4; i++ {
+		i := i
+		r.push(func() { order = append(order, i) })
+	}
+	job, _ := r.pop()
+	job()
+	r.push(func() { order = append(order, 4) })
+	r.reserve(8)
+	if len(r.buf) < r.len()+8 {
+		t.Fatalf("capacity = %d, need at least %d", len(r.buf), r.len()+8)
+	}
+	for r.len() > 0 {
+		job, _ := r.pop()
+		job()
+	}
+	want := []int{0, 1, 2, 3, 4}
+	if len(order) != len(want) {
+		t.Fatalf("order = %v, want %v", order, want)
+	}
+	for i := range want {
+		if order[i] != want[i] {
+			t.Fatalf("order = %v, want %v", order, want)
+		}
+	}
+}
