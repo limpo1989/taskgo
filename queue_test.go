@@ -478,11 +478,21 @@ func TestSubmitRejectsAfterStop(t *testing.T) {
 
 func TestStopDispersesIdleWorkers(t *testing.T) {
 	q := New(WithConcurrency(3), WithMaxIdle(time.Minute), withManualJanitor())
+	started := make(chan struct{}, 3)
+	release := make(chan struct{})
 	var wg sync.WaitGroup
 	wg.Add(3)
 	for i := 0; i < 3; i++ {
-		q.Push(func() { wg.Done() })
+		q.Push(func() {
+			started <- struct{}{}
+			<-release
+			wg.Done()
+		})
 	}
+	for i := 0; i < 3; i++ {
+		<-started
+	}
+	close(release)
 	wg.Wait()
 	waitFor(t, time.Second, func() bool { return q.idleLen() == 3 })
 	// Stop should dismiss every parked worker and return promptly, since they
