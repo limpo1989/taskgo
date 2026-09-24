@@ -2,6 +2,7 @@ package taskgo
 
 import (
 	"context"
+	"strconv"
 	"sync"
 	"testing"
 	"time"
@@ -94,6 +95,99 @@ func BenchmarkPendingSubmitBatch(b *testing.B) {
 			done.Wait()
 			b.StopTimer()
 			stop()
+		})
+	}
+}
+
+func BenchmarkShardedPush(b *testing.B) {
+	const producers = 16
+	for _, shards := range []int{1, 32, 64} {
+		b.Run("shards="+strconv.Itoa(shards), func(b *testing.B) {
+			q := New(WithConcurrency(10000), WithShards(shards), WithMaxIdle(time.Second))
+			var done sync.WaitGroup
+			done.Add(b.N)
+			job := func() { done.Done() }
+			b.ResetTimer()
+			var producersDone sync.WaitGroup
+			producersDone.Add(producers)
+			for p := 0; p < producers; p++ {
+				go func(p int) {
+					defer producersDone.Done()
+					for i := p; i < b.N; i += producers {
+						q.Push(job)
+					}
+				}(p)
+			}
+			producersDone.Wait()
+			done.Wait()
+			b.StopTimer()
+			_ = q.Stop(context.Background())
+		})
+	}
+}
+
+func BenchmarkShardedIngress(b *testing.B) {
+	const producers = 256
+	for _, shards := range []int{1, 32, 64} {
+		b.Run("shards="+strconv.Itoa(shards), func(b *testing.B) {
+			q := New(WithConcurrency(10000), WithShards(shards))
+			var done sync.WaitGroup
+			done.Add(b.N)
+			release := make(chan struct{})
+			job := func() {
+				<-release
+				done.Done()
+			}
+			b.ResetTimer()
+			var producersDone sync.WaitGroup
+			producersDone.Add(producers)
+			for p := 0; p < producers; p++ {
+				go func(p int) {
+					defer producersDone.Done()
+					for i := p; i < b.N; i += producers {
+						q.Push(job)
+					}
+				}(p)
+			}
+			producersDone.Wait()
+			b.StopTimer()
+			close(release)
+			done.Wait()
+			_ = q.Stop(context.Background())
+		})
+	}
+}
+
+func BenchmarkShardedSubmit(b *testing.B) {
+	const producers = 256
+	for _, shards := range []int{1, 32, 64} {
+		b.Run("shards="+strconv.Itoa(shards), func(b *testing.B) {
+			q := New(WithConcurrency(10000), WithShards(shards), WithMaxPending(b.N))
+			var done sync.WaitGroup
+			done.Add(b.N)
+			release := make(chan struct{})
+			job := func() {
+				<-release
+				done.Done()
+			}
+			b.ResetTimer()
+			var producersDone sync.WaitGroup
+			producersDone.Add(producers)
+			for p := 0; p < producers; p++ {
+				go func(p int) {
+					defer producersDone.Done()
+					for i := p; i < b.N; i += producers {
+						if !q.Submit(job) {
+							panic("unexpected rejection")
+						}
+					}
+				}(p)
+			}
+			producersDone.Wait()
+			b.StopTimer()
+			close(release)
+			done.Wait()
+			_ = q.Stop(context.Background())
 		})
 	}
 }

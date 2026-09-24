@@ -23,6 +23,7 @@ const (
 	defaultMaxIdle     = 0 // 0 means no parking: a worker exits once the queue drains
 	defaultMaxJobs     = 0 // 0 means no per-worker task limit
 	defaultMaxPending  = 0 // 0 means Submit is not admission-limited
+	defaultShards      = 1 // 1 keeps the original single-queue scheduler
 	defaultTimeout     = 30 * time.Second
 )
 
@@ -31,6 +32,7 @@ type options struct {
 	maxIdle     time.Duration // how long a worker may stay parked; <=0 disables parking
 	maxJobs     int           // task count after which a worker is recycled; <=0 means no limit
 	maxPending  int           // maximum outstanding Submit jobs; <=0 means no limit
+	shards      int           // number of ingress queues; <=1 disables sharding
 	timeout     time.Duration // how long Stop waits for outstanding tasks
 	panicFn     func(v any)   // task panic handler; when non-nil, panics are recovered
 
@@ -49,6 +51,7 @@ func newOptions(opts []Option) *options {
 		maxIdle:     defaultMaxIdle,
 		maxJobs:     defaultMaxJobs,
 		maxPending:  defaultMaxPending,
+		shards:      defaultShards,
 		timeout:     defaultTimeout,
 	}
 	for _, f := range opts {
@@ -68,6 +71,9 @@ func newOptions(opts []Option) *options {
 	}
 	if o.maxPending < 0 {
 		o.maxPending = 0
+	}
+	if o.shards < 1 {
+		o.shards = defaultShards
 	}
 	if o.nowFn == nil {
 		o.nowFn = time.Now
@@ -113,6 +119,13 @@ func WithMaxJobs(n int) Option {
 // rejection should set an explicit bound.
 func WithMaxPending(n int) Option {
 	return func(o *options) { o.maxPending = n }
+}
+
+// WithShards enables striped ingress queues. Producers choose a lightly loaded
+// shard, while workers can steal from every shard. Values <=1 keep the original
+// single-queue scheduler and its global FIFO behavior.
+func WithShards(n int) Option {
+	return func(o *options) { o.shards = n }
 }
 
 // WithTimeout sets how long Stop waits for outstanding tasks. The default is 30s.

@@ -114,26 +114,44 @@ type worker[T any] struct {
 // taskQueue contains the scheduling implementation shared by Queue and Task.
 // run is bound once at construction and is called directly with each queued T.
 type taskQueue[T any] struct {
-	submitPending  int64 // atomically released by workers; admission is serialized by mu
-	mu             sync.Mutex
-	opt            *options
-	backlog        *taskRing[T]
-	idle           []*worker[T]
-	pool           sync.Pool
-	running        int
-	stopped        bool
-	janitorRunning bool
+	submitPending     int64 // atomically released by workers; admission is serialized by mu
+	runningAtomic     int64
+	shardCursor       uint64
+	popCursor         uint64
+	stoppedAtomic     int32
+	mu                sync.Mutex
+	opt               *options
+	backlog           *taskRing[T]
+	shards            []taskShard[T]
+	wake              chan struct{}
+	dispatchWake      chan struct{}
+	dispatchStop      chan struct{}
+	dispatcherStarted int32
+	ingress           sync.RWMutex
+	idle              []*worker[T]
+	pool              sync.Pool
+	running           int
+	stopped           bool
+	janitorRunning    bool
 
 	onSpawnForTest func()
 	run            func(T)
 }
 
 func newTaskQueue[T any](opts []Option, run func(T)) *taskQueue[T] {
-	return &taskQueue[T]{
-		opt:     newOptions(opts),
+	o := newOptions(opts)
+	q := &taskQueue[T]{
+		opt:     o,
 		backlog: newTaskRing[T](8),
 		run:     run,
 	}
+	if o.shards > 1 {
+		q.shards = newTaskShards[T](o.shards)
+		q.wake = make(chan struct{}, o.concurrency)
+		q.dispatchWake = make(chan struct{}, 1)
+		q.dispatchStop = make(chan struct{})
+	}
+	return q
 }
 
 func (q *taskQueue[T]) push(value T) bool {
@@ -143,6 +161,17 @@ func (q *taskQueue[T]) push(value T) bool {
 func (q *taskQueue[T]) pushBatch(values []T) int {
 	if len(values) == 0 {
 		return 0
+	}
+	if len(q.shards) > 1 && atomic.LoadInt32(&q.stoppedAtomic) == 0 &&
+		atomic.LoadInt64(&q.runningAtomic) >= int64(q.opt.concurrency) {
+		accepted := 0
+		for _, value := range values {
+			if !q.enqueueSharded(taskItem[T]{value: value}) {
+				break
+			}
+			accepted++
+		}
+		return accepted
 	}
 
 	q.mu.Lock()
@@ -167,34 +196,41 @@ func (q *taskQueue[T]) submit(value T) bool {
 }
 
 func (q *taskQueue[T]) submitBatch(values []T, atomicBatch bool) (accepted int, allAccepted bool) {
+	if len(values) == 0 {
+		q.mu.Lock()
+		stopped := q.stopped
+		q.mu.Unlock()
+		return 0, !stopped
+	}
+
+	accepted, ok := q.reservePendingBatch(len(values), atomicBatch)
+	if !ok {
+		return 0, false
+	}
+	submitted := q.opt.maxPending > 0
+	if len(q.shards) > 1 && atomic.LoadInt32(&q.stoppedAtomic) == 0 &&
+		atomic.LoadInt64(&q.runningAtomic) >= int64(q.opt.concurrency) {
+		admitted := 0
+		for _, value := range values[:accepted] {
+			if !q.enqueueSharded(taskItem[T]{value: value, submitted: submitted}) {
+				break
+			}
+			admitted++
+		}
+		if submitted && admitted < accepted {
+			atomic.AddInt64(&q.submitPending, -int64(accepted-admitted))
+		}
+		return admitted, admitted == len(values)
+	}
+
 	q.mu.Lock()
 	if q.stopped {
 		q.mu.Unlock()
+		if submitted {
+			atomic.AddInt64(&q.submitPending, -int64(accepted))
+		}
 		return 0, false
 	}
-	if len(values) == 0 {
-		q.mu.Unlock()
-		return 0, true
-	}
-
-	accepted = len(values)
-	if q.opt.maxPending > 0 {
-		available := q.opt.maxPending - int(atomic.LoadInt64(&q.submitPending))
-		if atomicBatch && available < accepted {
-			q.mu.Unlock()
-			return 0, false
-		}
-		if available < accepted {
-			accepted = available
-		}
-		if accepted == 0 {
-			q.mu.Unlock()
-			return 0, false
-		}
-		atomic.AddInt64(&q.submitPending, int64(accepted))
-	}
-
-	submitted := q.opt.maxPending > 0
 	actions := make([]taskDispatch[T], 0, q.batchDispatchCapacity(accepted))
 	for _, value := range values[:accepted] {
 		q.enqueueItemLocked(taskItem[T]{value: value, submitted: submitted}, &actions)
@@ -205,6 +241,10 @@ func (q *taskQueue[T]) submitBatch(values []T, atomicBatch bool) (accepted int, 
 }
 
 func (q *taskQueue[T]) pushItem(item taskItem[T]) bool {
+	if len(q.shards) > 1 && atomic.LoadInt32(&q.stoppedAtomic) == 0 &&
+		atomic.LoadInt64(&q.runningAtomic) >= int64(q.opt.concurrency) {
+		return q.enqueueSharded(item)
+	}
 	q.mu.Lock()
 	if q.stopped {
 		q.mu.Unlock()
@@ -220,14 +260,131 @@ func (q *taskQueue[T]) pushItem(item taskItem[T]) bool {
 	return true
 }
 
-func (q *taskQueue[T]) submitItem(value T) bool {
-	q.mu.Lock()
-	if q.stopped || atomic.LoadInt64(&q.submitPending) >= int64(q.opt.maxPending) {
-		q.mu.Unlock()
+func (q *taskQueue[T]) enqueueSharded(item taskItem[T]) bool {
+	q.ingress.RLock()
+	defer q.ingress.RUnlock()
+	if atomic.LoadInt32(&q.stoppedAtomic) != 0 {
 		return false
 	}
-	atomic.AddInt64(&q.submitPending, 1)
+	s := q.pickTaskShard()
+	if s.push(item) {
+		q.signalDispatcher()
+	}
+	return true
+}
+
+func (q *taskQueue[T]) signalDispatcher() {
+	if atomic.LoadInt32(&q.stoppedAtomic) != 0 {
+		return
+	}
+	if atomic.CompareAndSwapInt32(&q.dispatcherStarted, 0, 1) {
+		go q.shardedDispatcher()
+	}
+	select {
+	case q.dispatchWake <- struct{}{}:
+	default:
+	}
+}
+
+func (q *taskQueue[T]) shardedDispatcher() {
+	for {
+		select {
+		case <-q.dispatchWake:
+			q.replenishSharded()
+		case <-q.dispatchStop:
+			return
+		}
+	}
+}
+
+func (q *taskQueue[T]) replenishSharded() {
+	q.mu.Lock()
+	if q.stopped {
+		q.mu.Unlock()
+		return
+	}
+	var spawns []taskDispatch[T]
+	for q.running < q.opt.concurrency {
+		next, ok := q.popSharded()
+		if !ok {
+			break
+		}
+		if k := len(q.idle); k > 0 {
+			w := q.idle[k-1]
+			q.idle[k-1] = nil
+			q.idle = q.idle[:k-1]
+			q.running++
+			atomic.AddInt64(&q.runningAtomic, 1)
+			w.ch <- taskMessage[T]{item: next}
+			continue
+		}
+		q.running++
+		atomic.AddInt64(&q.runningAtomic, 1)
+		spawns = append(spawns, taskDispatch[T]{item: next})
+	}
+	q.mu.Unlock()
+	for _, action := range spawns {
+		q.spawn(q.acquire(), action.item.value, action.item.submitted)
+	}
+}
+
+func (q *taskQueue[T]) pickTaskShard() *taskShard[T] {
+	n := uint64(len(q.shards))
+	a := atomic.AddUint64(&q.shardCursor, 1) % n
+	b := (a*6364136223846793005 + 1442695040888963407) % n
+	if b == a {
+		b = (b + 1) % n
+	}
+	if q.shards[b].len() < q.shards[a].len() {
+		a = b
+	}
+	return &q.shards[a]
+}
+
+func (q *taskQueue[T]) popSharded() (taskItem[T], bool) {
+	n := uint64(len(q.shards))
+	start := atomic.AddUint64(&q.popCursor, 1) % n
+	for i := uint64(0); i < n; i++ {
+		if item, ok := q.shards[(start+i)%n].pop(); ok {
+			return item, true
+		}
+	}
+	return taskItem[T]{}, false
+}
+
+func (q *taskQueue[T]) removeIdleLocked(w *worker[T]) bool {
+	for i, candidate := range q.idle {
+		if candidate != w {
+			continue
+		}
+		last := len(q.idle) - 1
+		q.idle[i] = q.idle[last]
+		q.idle[last] = nil
+		q.idle = q.idle[:last]
+		return true
+	}
+	return false
+}
+
+func (q *taskQueue[T]) submitItem(value T) bool {
+	if !q.reservePending(1) {
+		return false
+	}
 	item := taskItem[T]{value: value, submitted: true}
+	if len(q.shards) > 1 && atomic.LoadInt32(&q.stoppedAtomic) == 0 &&
+		atomic.LoadInt64(&q.runningAtomic) >= int64(q.opt.concurrency) {
+		if !q.enqueueSharded(item) {
+			q.releaseSubmitted()
+			return false
+		}
+		return true
+	}
+	q.mu.Lock()
+	if q.stopped {
+		q.mu.Unlock()
+		q.releaseSubmitted()
+		return false
+	}
 	w, spawn := q.enqueueSingleLocked(item)
 	q.mu.Unlock()
 	if w != nil {
@@ -236,6 +393,37 @@ func (q *taskQueue[T]) submitItem(value T) bool {
 		q.spawn(q.acquire(), value, true)
 	}
 	return true
+}
+
+func (q *taskQueue[T]) reservePending(n int) bool {
+	_, ok := q.reservePendingBatch(n, true)
+	return ok
+}
+
+func (q *taskQueue[T]) reservePendingBatch(n int, atomicBatch bool) (int, bool) {
+	if atomic.LoadInt32(&q.stoppedAtomic) != 0 {
+		return 0, false
+	}
+	if q.opt.maxPending <= 0 {
+		return n, true
+	}
+	for {
+		current := atomic.LoadInt64(&q.submitPending)
+		available := int64(q.opt.maxPending) - current
+		accepted := int64(n)
+		if available < accepted {
+			if atomicBatch {
+				return 0, false
+			}
+			accepted = available
+		}
+		if accepted <= 0 {
+			return 0, false
+		}
+		if atomic.CompareAndSwapInt64(&q.submitPending, current, current+accepted) {
+			return int(accepted), true
+		}
+	}
 }
 
 func (q *taskQueue[T]) enqueueSingleLocked(item taskItem[T]) (*worker[T], bool) {
@@ -247,10 +435,16 @@ func (q *taskQueue[T]) enqueueSingleLocked(item taskItem[T]) (*worker[T], bool) 
 		q.idle[k-1] = nil
 		q.idle = q.idle[:k-1]
 		q.running++
+		if len(q.shards) > 1 {
+			atomic.AddInt64(&q.runningAtomic, 1)
+		}
 		return w, false
 	}
 	if q.running < q.opt.concurrency {
 		q.running++
+		if len(q.shards) > 1 {
+			atomic.AddInt64(&q.runningAtomic, 1)
+		}
 		return nil, true
 	}
 	q.backlog.push(item)
@@ -266,6 +460,9 @@ func (q *taskQueue[T]) enqueueItemLocked(item taskItem[T], actions *[]taskDispat
 		q.idle[k-1] = nil
 		q.idle = q.idle[:k-1]
 		q.running++
+		if len(q.shards) > 1 {
+			atomic.AddInt64(&q.runningAtomic, 1)
+		}
 		*actions = append(*actions, taskDispatch[T]{worker: w, item: item})
 		return
 	}
@@ -273,6 +470,9 @@ func (q *taskQueue[T]) enqueueItemLocked(item taskItem[T], actions *[]taskDispat
 	// 2) No parked worker and the concurrency limit is not reached: start one.
 	if q.running < q.opt.concurrency {
 		q.running++
+		if len(q.shards) > 1 {
+			atomic.AddInt64(&q.runningAtomic, 1)
+		}
 		*actions = append(*actions, taskDispatch[T]{item: item})
 		return
 	}
@@ -301,8 +501,12 @@ func (q *taskQueue[T]) dispatchBatch(actions []taskDispatch[T]) {
 // Len returns the number of tasks queued but not yet started.
 func (q *taskQueue[T]) Len() int {
 	q.mu.Lock()
-	defer q.mu.Unlock()
-	return q.backlog.len()
+	length := q.backlog.len()
+	q.mu.Unlock()
+	for i := range q.shards {
+		length += q.shards[i].len()
+	}
+	return length
 }
 
 // Stop shuts the queue down and waits for outstanding tasks to finish.
@@ -312,15 +516,22 @@ func (q *taskQueue[T]) Len() int {
 // by ctx and WithTimeout is reached. Stop returns nil on a clean drain, or the
 // context error on timeout or cancellation.
 func (q *taskQueue[T]) Stop(ctx context.Context) error {
+	q.ingress.Lock()
 	q.mu.Lock()
 	if q.stopped {
 		q.mu.Unlock()
+		q.ingress.Unlock()
 		return nil
 	}
 	q.stopped = true
+	atomic.StoreInt32(&q.stoppedAtomic, 1)
 	idle := q.idle
 	q.idle = nil
+	if q.dispatchStop != nil {
+		close(q.dispatchStop)
+	}
 	q.mu.Unlock()
+	q.ingress.Unlock()
 
 	// Dismiss every parked worker; each is blocked on <-w.ch.
 	for _, w := range idle {
@@ -349,8 +560,17 @@ func (q *taskQueue[T]) Stop(ctx context.Context) error {
 
 func (q *taskQueue[T]) finished() bool {
 	q.mu.Lock()
-	defer q.mu.Unlock()
-	return q.backlog.len()+q.running == 0
+	finished := q.backlog.len()+q.running == 0
+	q.mu.Unlock()
+	if !finished {
+		return false
+	}
+	for i := range q.shards {
+		if q.shards[i].len() != 0 {
+			return false
+		}
+	}
+	return true
 }
 
 // worker is the main loop of a worker goroutine.
@@ -359,6 +579,10 @@ func (q *taskQueue[T]) finished() bool {
 // takes only the mutex and uses no channel. It parks on its own channel to wait
 // for reuse or reclamation only when the queue is empty and parking is enabled.
 func (q *taskQueue[T]) worker(w *worker[T], item taskItem[T]) {
+	if len(q.shards) > 1 {
+		q.workerSharded(w, item)
+		return
+	}
 	n := 0
 	for {
 		q.exec(item.value)
@@ -370,7 +594,7 @@ func (q *taskQueue[T]) worker(w *worker[T], item taskItem[T]) {
 
 		q.mu.Lock()
 		if next, ok := q.backlog.pop(); ok {
-			if capReached && !q.stopped {
+			if capReached && atomic.LoadInt32(&q.stoppedAtomic) == 0 {
 				// The per-worker task cap was reached: hand the next task to a
 				// fresh worker (with a fresh stack) and exit. The running count
 				// is unchanged, as one leaves and one starts.
@@ -387,6 +611,9 @@ func (q *taskQueue[T]) worker(w *worker[T], item taskItem[T]) {
 		// The queue is empty.
 		if q.stopped || capReached || q.opt.maxIdle <= 0 {
 			q.running--
+			if len(q.shards) > 1 {
+				atomic.AddInt64(&q.runningAtomic, -1)
+			}
 			q.mu.Unlock()
 			q.release(w)
 			return
@@ -394,6 +621,9 @@ func (q *taskQueue[T]) worker(w *worker[T], item taskItem[T]) {
 
 		// Park: move from running to idle and wait to be woken or reclaimed.
 		q.running--
+		if len(q.shards) > 1 {
+			atomic.AddInt64(&q.runningAtomic, -1)
+		}
 		w.lastUsed = q.opt.nowFn()
 		q.idle = append(q.idle, w)
 		q.ensureJanitorLocked()
@@ -408,6 +638,135 @@ func (q *taskQueue[T]) worker(w *worker[T], item taskItem[T]) {
 		// Woken from parking: the GC may have shrunk the stack meanwhile, so
 		// reset the counter to avoid a premature maxJobs trigger.
 		n = 0
+	}
+}
+
+func (q *taskQueue[T]) workerSharded(w *worker[T], item taskItem[T]) {
+	n := 0
+	for {
+		q.exec(item.value)
+		if item.submitted {
+			q.releaseSubmitted()
+		}
+		n++
+		capReached := q.opt.maxJobs > 0 && n >= q.opt.maxJobs
+		if n&15 == 0 {
+			q.mu.Lock()
+			if next, ok := q.backlog.pop(); ok {
+				if capReached && !q.stopped {
+					q.mu.Unlock()
+					q.spawn(q.acquire(), next.value, next.submitted)
+					q.release(w)
+					return
+				}
+				q.mu.Unlock()
+				item = next
+				continue
+			}
+			q.mu.Unlock()
+		}
+
+		if next, ok := q.popSharded(); ok {
+			if capReached && atomic.LoadInt32(&q.stoppedAtomic) == 0 {
+				q.spawn(q.acquire(), next.value, next.submitted)
+				q.release(w)
+				return
+			}
+			item = next
+			continue
+		}
+
+		q.mu.Lock()
+		if next, ok := q.backlog.pop(); ok {
+			if capReached && !q.stopped {
+				q.mu.Unlock()
+				q.spawn(q.acquire(), next.value, next.submitted)
+				q.release(w)
+				return
+			}
+			q.mu.Unlock()
+			item = next
+			continue
+		}
+		if next, ok := q.popSharded(); ok {
+			if capReached && atomic.LoadInt32(&q.stoppedAtomic) == 0 {
+				q.mu.Unlock()
+				q.spawn(q.acquire(), next.value, next.submitted)
+				q.release(w)
+				return
+			}
+			q.mu.Unlock()
+			item = next
+			continue
+		}
+
+		if q.stopped || capReached || q.opt.maxIdle <= 0 {
+			q.signalDispatcher()
+			q.running--
+			if len(q.shards) > 1 {
+				atomic.AddInt64(&q.runningAtomic, -1)
+			}
+			q.mu.Unlock()
+			q.release(w)
+			return
+		}
+
+		q.running--
+		atomic.AddInt64(&q.runningAtomic, -1)
+		w.lastUsed = q.opt.nowFn()
+		q.idle = append(q.idle, w)
+		q.ensureJanitorLocked()
+		q.mu.Unlock()
+
+		for {
+			select {
+			case message := <-w.ch:
+				if message.stop {
+					q.release(w)
+					return
+				}
+				item = message.item
+				n = 0
+				goto nextTask
+			case <-q.wake:
+				q.mu.Lock()
+				if !q.removeIdleLocked(w) {
+					q.mu.Unlock()
+					continue
+				}
+				q.running++
+				atomic.AddInt64(&q.runningAtomic, 1)
+				q.mu.Unlock()
+				if next, ok := q.popSharded(); ok {
+					item = next
+					n = 0
+					goto nextTask
+				}
+				q.mu.Lock()
+				if next, ok := q.backlog.pop(); ok {
+					q.mu.Unlock()
+					item = next
+					n = 0
+					goto nextTask
+				}
+				q.mu.Unlock()
+				q.mu.Lock()
+				if q.stopped {
+					q.running--
+					atomic.AddInt64(&q.runningAtomic, -1)
+					q.mu.Unlock()
+					q.release(w)
+					return
+				}
+				q.running--
+				atomic.AddInt64(&q.runningAtomic, -1)
+				w.lastUsed = q.opt.nowFn()
+				q.idle = append(q.idle, w)
+				q.ensureJanitorLocked()
+				q.mu.Unlock()
+			}
+		}
+	nextTask:
 	}
 }
 

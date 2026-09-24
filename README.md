@@ -64,6 +64,7 @@ func WithConcurrency(n int) Option           // max concurrent workers (default 
 func WithMaxIdle(d time.Duration) Option     // park idle workers for d (default 0 = off)
 func WithMaxJobs(n int) Option               // recycle a worker after n tasks (default 0 = off)
 func WithMaxPending(n int) Option            // bound outstanding Submit jobs (default 0 = off)
+func WithShards(n int) Option                 // striped ingress queues (default 1 = off)
 func WithTimeout(d time.Duration) Option     // how long Stop waits (default 30s)
 func WithPanicHandler(fn func(v any)) Option // recover task panics
 ```
@@ -133,15 +134,22 @@ the number accepted, and those accepted values are exactly `values[:n]`; the
 rest were rejected by the pending limit or shutdown. Use `TrySubmitBatch` when
 partial submission is not acceptable. FIFO controls queue order; with
 concurrency greater than one, task start and completion order can still
-interleave. Use `WithConcurrency(1)` when execution order must be strict.
+interleave. Use `WithConcurrency(1)` with sharding disabled when execution order
+must be strict.
 
 ## How it works
 
-`Push` follows three paths, all under one mutex:
+With the default single queue, `Push` follows three paths under one mutex:
 
 1. **A parked worker exists** → wake it (LIFO, so the hottest stack is reused).
 2. **No parked worker and below the concurrency limit** → start a new worker.
 3. **At the limit** → enqueue the task; a looping worker will pick it up.
+
+With `WithShards(n)`, once the global worker limit is full, the producer puts the
+task into one of `n` shard rings without taking the scheduler mutex. It samples
+two shards and chooses the shorter one. Workers first drain available shard work
+and steal from other shards when needed. This removes the single enqueue lock from
+the contended path, while allowing idle workers to help busy shards.
 
 A worker runs its task, then while the queue is non-empty it pulls the next task
 directly (the hot path — one mutex, no channel). When the queue drains it either
@@ -153,6 +161,13 @@ janitor after `maxIdle`. Parked workers are excluded from the running count, so
 `Submit` is the executor-oriented API. With `WithMaxPending(n)`, it rejects
 without blocking once `n` running or queued submissions are outstanding;
 legacy `Push` remains unbounded for compatibility.
+
+`WithShards(n)` enables striped ingress queues for workloads with many concurrent
+producers. Producers use two-choice load balancing, and workers steal from other
+shards when their current shard is empty. This option is opt-in because sharding
+adds selection and stealing overhead for short tasks, and global FIFO ordering is
+replaced by per-shard FIFO ordering. Start with 2-4 shards per `GOMAXPROCS`; the
+worker concurrency limit remains global.
 
 ## Tuning
 
