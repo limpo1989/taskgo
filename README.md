@@ -23,8 +23,9 @@ as a resident pool: a worker is reclaimed once it has been idle longer than
 - **Short-lived worker reuse** to avoid repeated stack growth for deep-stack tasks.
 - Two independent reclamation triggers: idle timeout (`WithMaxIdle`) and a
   per-worker task cap (`WithMaxJobs`).
-- Zero-overhead hot path: when parking is disabled (the default) the dispatch
-  path takes a single mutex and uses no channels.
+- Low-latency dispatch: tasks wait in a lock-free FIFO queue, so submitting
+  never takes a lock or blocks while workers are busy, and about `GOMAXPROCS`
+  workers run until tasks block, instead of flooding the Go scheduler.
 - Graceful shutdown that drains outstanding work, with a deadline.
 - Optional panic handler so a panicking task cannot crash the process.
 
@@ -137,23 +138,49 @@ interleave. Use `WithConcurrency(1)` when execution order must be strict.
 
 ## How it works
 
-`Push` follows three paths, all under one mutex:
+Tasks wait in a lock-free FIFO queue: a chain of fixed-size rings that doubles
+when full and shrinks back once a burst has drained. Submitting publishes the
+task and then checks whether enough workers are running:
 
-1. **A parked worker exists** → wake it (LIFO, so the hottest stack is reused).
-2. **No parked worker and below the concurrency limit** → start a new worker.
-3. **At the limit** → enqueue the task; a looping worker will pick it up.
+1. **Enough workers are running** (the normal case under load) → nothing else
+   to do. The submitter takes no lock and never blocks, so an event loop that
+   hands work to the pool is never parked behind it.
+2. **A running slot is free and a worker is parked** → wake it (LIFO, so the
+   hottest stack is reused).
+3. **A running slot is free and nobody is parked** → start a new worker, up to
+   `WithConcurrency`.
 
-When the queue is busy, a worker claims a small local batch from the central
-backlog under the mutex and runs that batch without taking the mutex again. This
-keeps the queue lock out of the per-task hot path while retaining FIFO backlog
-order. When the queue drains it either exits (parking disabled, stopped, or task
-cap reached) or **parks** on its own channel, waiting to be woken by the next
-`Push` or reclaimed by the background janitor after `maxIdle`. Parked workers are
-excluded from the running count, so `Stop` can tell when all real work is done.
+Workers take one task at a time from the shared queue, so a worker that loses
+its CPU never holds tasks another worker could run. (Only when workers collide
+on the queue head, which takes tasks shorter than a CAS round trip, do they
+claim small batches.) When the queue is empty a worker parks on its own channel
+for up to `maxIdle`, or exits when parking is disabled, the queue is stopped,
+or it has handled `maxJobs` tasks. Parked workers are excluded from the running
+count, so `Stop` can tell when all real work is done.
 
-`PushBatch` admits each value through a short critical section so workers can
-claim backlog work between values in a large producer batch. `TrySubmitBatch`
-keeps its single critical section and all-or-nothing behavior.
+**The running worker count follows the CPU, not the concurrency limit.** About
+one worker per P (`GOMAXPROCS`) runs tasks. Once every P is busy, more runnable
+workers add no throughput: they only lengthen the Go scheduler's run queues,
+and every goroutine in the process, including the ones submitting tasks, then
+waits longer for a CPU. A monitor goroutine, running only while tasks wait for
+a worker, adds workers when they help, that is when running workers block:
+
+- no task started during a 1 ms tick while workers are stuck in one: the target
+  doubles (tasks queued behind blocking tasks need that many workers);
+- tasks wait while the scheduler reports idle Ps: the target grows (Go 1.26+
+  reads the scheduler's runnable and running goroutine counts from
+  `runtime/metrics`; older runtimes use the monitor's own wake-up latency);
+- tasks arrive more than twice as fast as they start, with the backlog
+  growing: other goroutines are taking the CPU the workers need, and more
+  workers claim a larger share of it. Past 65,536 queued tasks, submitters also
+  yield their P after each submission until the backlog halves.
+
+The extra workers go again when the run queues get long or the blocked tasks
+finish. `WithConcurrency` stays the hard cap on live workers.
+
+`PushBatch`, `SubmitBatch` and `TrySubmitBatch` enqueue their values as one
+ordered run, claiming consecutive queue slots with a single CAS where they fit.
+`TrySubmitBatch` keeps its all-or-nothing admission.
 
 `Submit` is the executor-oriented API. With `WithMaxPending(n)`, it rejects
 without blocking once `n` running or queued submissions are outstanding;
@@ -175,141 +202,142 @@ legacy `Push` remains unbounded for compatibility.
   the one regrowth is amortized over many tasks.
 - The Go runtime shrinks stacks during GC, so a worker parked far longer than a
   GC cycle may have to regrow anyway; keep `maxIdle` modest.
+- **`WithConcurrency` is a ceiling for blocked work, not a worker count.** CPU
+  bound tasks run on about `GOMAXPROCS` workers whatever the limit; tasks that
+  block (I/O, locks, sleeps) get more workers automatically, up to the limit.
+  Size it for the most tasks you expect to be blocked at once.
 - Without `WithPanicHandler`, a panicking task propagates and crashes the
   process. Set it for untrusted tasks.
 
 ## Benchmarks
 
-Measured on the local Mac release workstation (`darwin/arm64`, Apple M4 Pro,
-12 logical CPUs, Go 1.27.1) with `GOMAXPROCS=12`, comparing two taskgo modes on
-identical workloads.
+Measured on a Mac (Apple M4 Pro, 12 logical CPUs, Go 1.27.1) with
+`GOMAXPROCS=12`, comparing two taskgo modes on identical workloads:
 
-- **taskgo-NoReuse** — `WithConcurrency(c)` (parking off).
-- **taskgo-Reuse** — `WithConcurrency(c)` + `WithMaxIdle(time.Second)`.
+- **NoReuse**: `WithConcurrency(c)` (parking off).
+- **Reuse**: `WithConcurrency(c)` + `WithMaxIdle(time.Second)`.
 
 Two task shapes are used: **Deep** (a ~256-frame call chain that forces stack
 growth) and **Shallow** (`fib(10)`, stacks never grow). Pool teardown is
-excluded from timing via `b.StopTimer()`. Numbers are average wall time per
-operation; lower is better. Go's normal benchmark calibration is used, so each
-row may use a different `b.N`.
+excluded from timing. Numbers are average wall time per operation, the median
+of three runs; lower is better.
 
-### Bursty load (each batch = concurrency, queue drains between batches), `concurrency = 48`
+### Bursty load, `WithConcurrency(48)`
 
-| Workload | taskgo-Reuse | taskgo-NoReuse |
+Each operation submits 2,000 batches of 48 tasks and waits for each batch, so
+the queue drains and the workers go idle between batches.
+
+| Workload | Reuse | NoReuse |
 |---|---:|---:|
-| **Deep** | **77.226 ms** | 294.011 ms |
-| Shallow | **39.416 ms** | 42.943 ms |
+| Deep | **63.4 ms** | 125.6 ms |
+| Shallow | **30.5 ms** | 38.8 ms |
 
-For deep-stack bursts, reuse is **3.7× faster** than taskgo without parking.
-Allocations drop from about 3.95 MB to 2.36 MB per operation.
+Parked workers keep their grown stacks, so deep-stack bursts run **2× faster**
+with Reuse, and shallow bursts take 21% less time. Reuse also allocates less:
+2.34 MB per operation, against 3.10 MB (Deep) and 3.42 MB (Shallow) without it.
 
-### Sustained saturation (one large batch, queue stays full), `concurrency = 48`
+### Sustained saturation, `WithConcurrency(48)`
 
-| Workload | taskgo-Reuse | taskgo-NoReuse |
+Each operation submits 100,000 tasks at once, so the queue stays full and the
+workers run tasks back to back.
+
+| Workload | Reuse | NoReuse |
 |---|---:|---:|
-| Deep | 57.366 ms | **41.440 ms** |
-| Shallow | **36.902 ms** | 38.709 ms |
+| Deep | 22.1 ms | 22.4 ms |
+| Shallow | 7.30 ms | 7.36 ms |
 
-The worker batch prefetch keeps taskgo competitive under saturation. On this
-host, parking reduces allocations but is slower for deep saturated work; the
-fastest engine varies with task shape and host scheduling load.
+The queue drains only at the end of each operation, so workers in both modes
+keep their stacks for almost every task, and the two perform the same.
 
-### High concurrency limit `WithConcurrency(10000)`, varying load
+### High concurrency limit, `WithConcurrency(10000)`
 
-Deep tasks, average ms per op:
+Each operation submits the given number of tasks at once and waits for them.
 
-| Load | taskgo-Reuse | taskgo-NoReuse |
-|---|---:|---:|
-| 1,000 | 0.560 ms | **0.413 ms** |
-| 10,000 | 6.607 ms | **4.081 ms** |
-| 100,000 | 70.221 ms | **39.491 ms** |
-| 500,000 | 353.594 ms | **210.240 ms** |
+| Load | Deep, Reuse | Deep, NoReuse | Shallow, Reuse | Shallow, NoReuse |
+|---|---:|---:|---:|---:|
+| 1,000 | **0.274 ms** | 0.296 ms | 0.101 ms | 0.102 ms |
+| 10,000 | 2.27 ms | 2.29 ms | 0.774 ms | 0.783 ms |
+| 100,000 | 22.1 ms | 22.0 ms | 7.39 ms | 7.39 ms |
+| 500,000 | 109.1 ms | 109.5 ms | 36.9 ms | 36.6 ms |
 
-Shallow tasks, average ms per op:
-
-| Load | taskgo-Reuse | taskgo-NoReuse |
-|---|---:|---:|
-| 1,000 | **0.379 ms** | 0.413 ms |
-| 10,000 | 4.080 ms | **3.791 ms** |
-| 100,000 | 42.071 ms | **39.677 ms** |
-| 500,000 | **190.113 ms** | 190.596 ms |
-
-At a very high concurrency cap with deep tasks, taskgo-NoReuse is faster on
-this host at 500K, while taskgo-Reuse uses about half the allocations. At large
-shallow loads, the two modes are nearly equal and Reuse remains more memory
-efficient.
+About `GOMAXPROCS` workers run tasks whatever the limit, so NoReuse has few
+stacks to regrow per operation, and the two modes stay within 8% of each other
+at every load.
 
 ### Typed task path
 
-The typed path binds the task function once and avoids a closure per value.
-Average wall time per operation on the same Mac host:
+The same scenarios with `Task[int]`, whose task function is bound once. Each
+task signals completion on a shared channel rather than a `sync.WaitGroup`, so
+these times include that channel traffic and are not comparable with the
+tables above.
 
 | Scenario | Task-Reuse | Task-NoReuse |
 |---|---:|---:|
-| Burst, Deep | **86.626 ms** | 287.508 ms |
-| Burst, Shallow | **46.749 ms** | 53.461 ms |
-| Saturated, Deep | 59.521 ms | **46.596 ms** |
-| Saturated, Shallow | 43.995 ms | **35.113 ms** |
+| Burst, Deep | **77.5 ms** | 125.8 ms |
+| Burst, Shallow | **32.4 ms** | 37.7 ms |
+| Saturated, Deep | 41.3 ms | 40.5 ms |
+| Saturated, Shallow | 21.4 ms | 21.4 ms |
 
-Typed high-concurrency Deep loads are `0.749/0.519 ms` at 1K,
-`6.729/4.833 ms` at 10K, `68.402/46.586 ms` at 100K, and
-`343.966/231.952 ms` at 500K for Reuse/NoReuse respectively.
+With `WithConcurrency(10000)` the two modes are within 5% of each other at
+every load: Deep tasks take 0.44/0.46 ms at 1K, 4.11/4.12 ms at 10K,
+41.2/41.1 ms at 100K and 204.5/203.8 ms at 500K for Reuse/NoReuse.
 
-### Submission and tail latency
+### Concurrent producers
 
-The local release gate uses 24 producers, 10K in-flight tasks, a 25 us CPU task,
-`GOMAXPROCS=12`, and 2M total tasks. Latency is measured from submission to
-task start, excluding task execution:
+16 producers push shallow tasks into one `WithConcurrency(48)` queue as fast as
+they can. Time per task:
 
-| Submission | P99 submit-to-start | P99 submit-to-complete |
+| Path | Reuse | NoReuse |
 |---|---:|---:|
-| batch32 | **331.85 ms** | **332.46 ms** |
-| batch1 | 27.06 ms | 27.13 ms |
+| `Queue` (a closure per task) | 211 ns | **174 ns** |
+| `Task[int]` | 137 ns | **104 ns** |
 
-The Mac result is CPU-saturated because this test intentionally drives 24
-producers and 10K in-flight busy-wait tasks on 12 logical CPUs.
+Reuse costs 22–32% more per task here: the workers keep catching up with the
+producers and going idle, and shallow tasks leave no grown stacks to reuse.
+This is the shallow workload the Tuning section suggests running without
+`WithMaxIdle`.
 
-The slow-task isolation gate also covers the soft worker target boundary. With
-23 blocked workers, fast-task P99 is `0.08 ms`; with all 24 initial workers
-blocked for 50 ms, the independent stall monitor creates overflow workers and
-fast-task P99 is `1.23 ms` instead of waiting for the first slow task. The same
-Mac run measured `2.05/1.59/0.02 ms` at 256/1,000/5,000 blocked workers.
+### Latency gates
 
-Reproduce the release gate on this Mac with:
+The tail gate drives 24 producers, 10,000 tasks in flight and a 25 µs CPU task
+through `WithConcurrency(10000)`, 2M tasks in total (`GOMAXPROCS=12`). The CPU
+is saturated, so by Little's law the mean wait is about 20 ms; the gate checks
+how evenly that wait is spread. Latency is measured from submission to task
+start, median of three runs:
+
+| Submission | p50 | p99 | p99.9 | max |
+|---|---:|---:|---:|---:|
+| batch32 | 18.8 ms | 48.1 ms | 137.4 ms | 408.3 ms |
+| batch1 | 20.1 ms | 27.4 ms | 28.7 ms | 54.6 ms |
+
+The batch32 maximum varied between 322 and 640 ms from run to run.
+
+The stall gates check that blocked workers do not hold up other tasks. With
+1,000 fast tasks submitted while 11, 12 (the base worker target at
+`GOMAXPROCS=12`), 256, 1,000 or 5,000 workers are blocked, fast-task P99 is
+0.02, 2.6, 2.2, 2.3 and 1.0 ms. When the fast tasks queue behind 256, 1,000 or
+5,000 blocking tasks that have not started yet, they need that many workers
+first, and their P99 is 7.1, 11.8 and 17.9 ms.
+
+Reproduce with:
 
 ```sh
 GOMAXPROCS=12 TASKGO_RUN_TAIL_REPRO=1 TASKGO_TAIL_TOTAL=2000000 \
 go test -run '^TestTailLatencyReproduction$' -count=1 -v
 
-GOMAXPROCS=12 TASKGO_RUN_STALL_REPRO=1 \
-go test -run '^TestStallLatencyReproduction$' -count=1 -v
+GOMAXPROCS=12 TASKGO_RUN_STALL_REPRO=1 TASKGO_RUN_STALL_BURST_REPRO=1 \
+go test -run '^TestStall(Burst)?LatencyReproduction$' -count=1 -v
 ```
 
-### Takeaways
-
-- **Deep-stack bursty load → enable `WithMaxIdle`.** The Mac results show
-  3.7x gains over taskgo-NoReuse in burst mode.
-- **Shallow high-volume load → measure both settings.** Reuse reduces
-  allocations and is competitive on this host; the fastest engine depends on
-  load shape.
-- **Batch32 submission is now bounded by worker waves rather than lock convoy.**
-  Worker prefetch and short batch critical sections bring the release P99 to
-  about 4 ms without adding a public mode or changing the stack reuse options.
-- **Blocked workers do not permanently pin the soft target.** A backlog stall
-  monitor grows the internal worker target in backlog-aware steps up to the
-  hard `WithConcurrency` limit, without requiring task completion to trigger
-  growth.
-
-The benchmark cases live in their own module under `benchmarks/`. Reproduce the
-taskgo modes with:
+The scheduling benchmarks live in their own module under `benchmarks/`:
 
 ```
 cd benchmarks
-GOMAXPROCS=12 go test -run '^$' -bench 'Benchmark(Burst|Saturated)/.*/taskgo-(NoReuse|Reuse)' -benchmem
-GOMAXPROCS=12 go test -run '^$' -bench 'BenchmarkHighConcurrency/.*/taskgo-(NoReuse|Reuse)' -benchmem
-GOMAXPROCS=12 go test -run '^$' -bench 'BenchmarkTyped(Burst|Saturated)/.*/taskgo-Task-(NoReuse|Reuse)' -benchmem
-GOMAXPROCS=12 go test -run '^$' -bench 'BenchmarkTypedHighConcurrency/.*/taskgo-Task-(NoReuse|Reuse)' -benchmem
-GOMAXPROCS=12 go test -run '^$' -bench 'BenchmarkConcurrentProducers/(Queue|Task\[int\])/(NoReuse|Reuse)' -benchmem
+GOMAXPROCS=12 go test -run '^$' -bench 'Benchmark(Burst|Saturated)/.*/taskgo-(NoReuse|Reuse)$' -benchmem -count=3
+GOMAXPROCS=12 go test -run '^$' -bench 'BenchmarkHighConcurrency/.*/.*/taskgo-(NoReuse|Reuse)$' -benchmem -count=3
+GOMAXPROCS=12 go test -run '^$' -bench 'BenchmarkTyped(Burst|Saturated)/.*/taskgo-Task-(NoReuse|Reuse)$' -benchmem -count=3
+GOMAXPROCS=12 go test -run '^$' -bench 'BenchmarkTypedHighConcurrency/.*/.*/taskgo-Task-(NoReuse|Reuse)$' -benchmem -count=3
+GOMAXPROCS=12 go test -run '^$' -bench 'BenchmarkConcurrentProducers' -benchmem -count=3
 ```
 
 The typed-versus-closure submission benchmark is part of the main module:
@@ -318,11 +346,9 @@ The typed-versus-closure submission benchmark is part of the main module:
 GOMAXPROCS=12 go test -run '^$' -bench 'BenchmarkPush(Closure|Typed)$' -benchmem
 ```
 
-On this Mac, the typed push benchmark reports 0 allocations and
-`330.8 ns/op`, while a closure capturing the same value reports 1 allocation,
-`343.9 ns/op`, and 24 bytes.
-The `BenchmarkTyped*` cases in `benchmarks/` compare `Task[int]` with the
-legacy `Queue` under the same burst, saturation, and high-concurrency loads.
+`BenchmarkPushTyped` reports 0 allocations at 240 ns/op; `BenchmarkPushClosure`,
+which captures the same value in a closure, reports one 24-byte allocation at
+255 ns/op.
 
 The real-time sawtooth, long-tail, and max-idle experiments depend on OS timer
 resolution, CPU capacity, scheduler load, and race instrumentation. They are

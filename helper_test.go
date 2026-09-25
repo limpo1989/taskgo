@@ -17,6 +17,7 @@
 package taskgo
 
 import (
+	"sync/atomic"
 	"testing"
 	"time"
 )
@@ -38,18 +39,31 @@ func waitFor(t *testing.T, timeout time.Duration, cond func() bool) {
 }
 
 // idleLen returns the number of currently parked workers (test only).
-func (q *Queue) idleLen() int {
+func (q *taskQueue[T]) idleLen() int {
 	q.mu.Lock()
 	defer q.mu.Unlock()
 	return len(q.idle)
 }
 
-// runningCount returns the number of workers currently executing a task
-// (test only).
-func (q *Queue) runningCount() int {
+// runningCount returns the number of workers not parked (test only).
+func (q *taskQueue[T]) runningCount() int {
+	return int(atomic.LoadInt64(&q.running))
+}
+
+// liveCount returns running+idle workers: the live worker goroutines, which is
+// exactly the gauge Prometheus would see for this pool (test only).
+func (q *taskQueue[T]) liveCount() int {
 	q.mu.Lock()
 	defer q.mu.Unlock()
-	return q.running
+	return q.live
+}
+
+// setBaseForTest pins the soft worker target, as a small GOMAXPROCS would.
+func (q *taskQueue[T]) setBaseForTest(n int64) {
+	q.mu.Lock()
+	q.base = n
+	atomic.StoreInt64(&q.target, n)
+	q.mu.Unlock()
 }
 
 // fib is a shallow-stack compute load shared by tests and benchmarks.
