@@ -218,14 +218,6 @@ func (bl burstLoad) run(push func(Job), completed *int64) {
 	}
 }
 
-// liveCount returns running+idle for a real queue: the number of live worker
-// goroutines, which is exactly the gauge Prometheus would see for this pool.
-func (q *Queue) liveCount() int {
-	q.mu.Lock()
-	defer q.mu.Unlock()
-	return q.running + len(q.idle)
-}
-
 // standardBurst is the shared workload across all real-queue scenarios. It
 // approximates ~4k tasks/s in short bursts with sub-millisecond tasks, scaled
 // down in absolute volume so the test runs in a few seconds while preserving

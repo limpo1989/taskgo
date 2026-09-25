@@ -80,8 +80,12 @@ func newOptions(opts []Option) *options {
 	return o
 }
 
+// autoWorkerLimit is the base running-worker target: one worker per P. A
+// larger base adds no throughput for CPU-bound tasks and lengthens the run
+// queues every goroutine waits in; blocked workers are compensated by the
+// monitor instead.
 func autoWorkerLimit(concurrency int) int {
-	limit := 2 * runtime.GOMAXPROCS(0)
+	limit := runtime.GOMAXPROCS(0)
 	if limit < 1 {
 		limit = 1
 	}
@@ -103,6 +107,10 @@ func backlogCapacityHint(workerTarget int) int {
 
 // WithConcurrency sets the maximum number of concurrent workers. The default
 // is 8.
+//
+// It is a hard cap, not the number of workers kept busy: about GOMAXPROCS
+// workers run tasks while the CPU is the bottleneck, and more are added, up to
+// n, while tasks wait behind workers that block.
 func WithConcurrency(n int) Option {
 	return func(o *options) { o.concurrency = n }
 }

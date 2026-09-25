@@ -184,7 +184,7 @@ func TestBacklogLen(t *testing.T) {
 	_ = q.Stop(context.Background())
 }
 
-func TestBacklogLenIncludesPrefetchedTasks(t *testing.T) {
+func TestBacklogLenCountsTasksBehindRunningOne(t *testing.T) {
 	q := New(WithConcurrency(1))
 	initialStarted := make(chan struct{})
 	releaseInitial := make(chan struct{})
@@ -194,20 +194,20 @@ func TestBacklogLenIncludesPrefetchedTasks(t *testing.T) {
 	})
 	<-initialStarted
 
-	prefetchedStarted := make(chan struct{})
-	releasePrefetched := make(chan struct{})
+	nextStarted := make(chan struct{})
+	releaseNext := make(chan struct{})
 	q.Push(func() {
-		close(prefetchedStarted)
-		<-releasePrefetched
+		close(nextStarted)
+		<-releaseNext
 	})
-	for i := 1; i < workerBatchSize; i++ {
+	for i := 1; i < queuedBehindRunning; i++ {
 		q.Push(func() {})
 	}
 
 	close(releaseInitial)
-	<-prefetchedStarted
-	waitFor(t, time.Second, func() bool { return q.Len() == workerBatchSize-1 })
-	close(releasePrefetched)
+	<-nextStarted
+	waitFor(t, time.Second, func() bool { return q.Len() == queuedBehindRunning-1 })
+	close(releaseNext)
 	if err := q.Stop(context.Background()); err != nil {
 		t.Fatalf("stop: %v", err)
 	}
@@ -250,6 +250,8 @@ func TestJanitorReclaimsExpired(t *testing.T) {
 	now := time.Unix(1000, 0)
 	q := New(WithConcurrency(2), WithMaxIdle(time.Second), withManualJanitor(),
 		withNowFunc(func() time.Time { return now }))
+	// Run both tasks on their own worker even when GOMAXPROCS is 1.
+	q.setBaseForTest(2)
 
 	var wg sync.WaitGroup
 	wg.Add(2)
@@ -681,11 +683,18 @@ func TestSoakHighConcurrency(t *testing.T) {
 	prodWG.Wait()
 
 	// Every submitted task must reach a terminal state: it either completed or
-	// its panic was recovered. Wait for that to settle.
+	// its panic was recovered. Wait for that to settle. How long the backlog
+	// takes to drain depends on the host, so only a stall fails the test.
 	total := atomic.LoadInt64(&submitted)
-	waitFor(t, 30*time.Second, func() bool {
-		return atomic.LoadInt64(&completed)+atomic.LoadInt64(&recovered) == total
-	})
+	finished := func() int64 { return atomic.LoadInt64(&completed) + atomic.LoadInt64(&recovered) }
+	for last, lastChange := finished(), time.Now(); last != total; {
+		time.Sleep(10 * time.Millisecond)
+		if now := finished(); now != last {
+			last, lastChange = now, time.Now()
+		} else if time.Since(lastChange) > 10*time.Second {
+			t.Fatalf("no task finished for 10s: %d of %d done", now, total)
+		}
+	}
 
 	close(stopMonitor)
 	monWG.Wait()
