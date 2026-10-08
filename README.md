@@ -62,6 +62,7 @@ func (q *Task[T]) Stop(ctx context.Context) error
 
 // Options
 func WithConcurrency(n int) Option           // max concurrent workers (default 8)
+func WithMaxBatchSize(n int) Option          // max tasks claimed together (default 8; 1 disables batching/rescue)
 func WithMaxIdle(d time.Duration) Option     // park idle workers for d (default 0 = off)
 func WithMaxJobs(n int) Option               // recycle a worker after n tasks (default 0 = off)
 func WithMaxPending(n int) Option            // bound outstanding Submit jobs (default 0 = off)
@@ -150,10 +151,22 @@ task and then checks whether enough workers are running:
 3. **A running slot is free and nobody is parked** → start a new worker, up to
    `WithConcurrency`.
 
-Workers take one task at a time from the shared queue, so a worker that loses
-its CPU never holds tasks another worker could run. (Only when workers collide
-on the queue head, which takes tasks shorter than a CAS round trip, do they
-claim small batches.) When the queue is empty a worker parks on its own channel
+Workers usually take one task at a time from the shared queue. When they
+collide on the queue head they grow batches up to `WithMaxBatchSize` (default
+eight). Setting the limit to one disables batching and stalled-batch rescue;
+the monitor still compensates for blocked workers. Unstarted
+batch tasks remain reclaimable: after five monitor ticks without progress, the
+monitor returns them to the shared queue so other workers can execute them.
+The original worker then handles 64 tasks singly before contention can grow
+its batches again. Task claims and progress share one atomic state, with no
+per-task clock, timer or allocation. The monitor samples every millisecond,
+so rescue typically starts after roughly 6–8 ms without progress, allowing
+short task and scheduler pauses to settle. Blocked-worker compensation keeps
+its separate, shorter observation window. Scheduler delays can extend the
+observation window, so it does not impose a hard 10 ms bound. A
+concurrency limit of one retains serial execution order.
+
+When the queue is empty a worker parks on its own channel
 for up to `maxIdle`, or exits when parking is disabled, the queue is stopped,
 or it has handled `maxJobs` tasks. Parked workers are excluded from the running
 count, so `Stop` can tell when all real work is done.
@@ -188,6 +201,12 @@ legacy `Push` remains unbounded for compatibility.
 
 ## Tuning
 
+- **`WithMaxBatchSize` bounds worker claims**, independently of submission
+  batch sizes. The default is 8; use `WithMaxBatchSize(1)` to always take one
+  task and disable stalled-batch rescue, or another positive limit such as
+  4 or 16 to keep adaptive batching within that limit. Larger buffers are
+  created once per worker and reused. Values outside 1 through 2^31-1 use
+  the default.
 - **`WithMaxIdle` is the key knob.** It only helps **bursty / intermittent**
   workloads with **deep call stacks**, where workers would otherwise be retired
   between bursts. Under sustained saturation the queue never drains, so stacks

@@ -1,6 +1,6 @@
 module github.com/limpo1989/taskgo/benchmarks
 
-go 1.18
+go 1.24.0
 
 require (
 	github.com/limpo1989/taskgo v0.0.0

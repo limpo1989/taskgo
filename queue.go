@@ -102,6 +102,9 @@ const (
 	// stuckTicks is how many consecutive ticks a worker must spend in one
 	// task before the monitor counts it as stuck.
 	stuckTicks = 2
+	// Moving a held batch is more disruptive than adding worker capacity.
+	// Wait longer so short task or scheduler pauses do not trigger a rescue.
+	batchRescueTicks = 5
 	// monitorIdleTicks is how many consecutive ticks without a backlog the
 	// monitor waits before it stops.
 	monitorIdleTicks = 50
@@ -125,10 +128,19 @@ const producerStopped = int64(1) << 62
 // worker is one worker goroutine's control block. The fields written for
 // every task are padded so that workers never share those cache lines.
 type worker[T any] struct {
-	_    [cacheLinePad]byte
-	seq  uint32 // atomic: bumped when the worker starts a task
-	held int32  // atomic: claimed tasks not yet started
-	_    [cacheLinePad - 8]byte
+	_ [cacheLinePad]byte
+	// state packs the task-start sequence in the high word and unstarted
+	// batch tasks (or a rescue marker) in the low word. One atomic operation
+	// both claims a task and records progress; the single-task path uses add.
+	state uint64
+	_     [cacheLinePad - 8]byte
+
+	// The owner publishes batchSize and batch through state. A rescuer must
+	// claim state before touching unstarted entries; the owner cannot reuse
+	// the buffer until the rescuer publishes batchRescued.
+	batchSize   int
+	batch       []taskItem[T]
+	inlineBatch [defaultMaxBatchSize]taskItem[T]
 
 	ch chan bool // wake-up (false) or exit (true) while parked; buffered 1
 
@@ -138,6 +150,17 @@ type worker[T any] struct {
 	index      int    // position in taskQueue.workers
 	lastSeq    uint32 // seq seen at the monitor's previous tick
 	stuckTicks int
+}
+
+// initBatch keeps the default-size buffer inside the control block. Larger
+// configured batches allocate once when the worker is created; pool reuse
+// preserves that buffer.
+func (w *worker[T]) initBatch(n int) {
+	if n <= len(w.inlineBatch) {
+		w.batch = w.inlineBatch[:n:n]
+	} else {
+		w.batch = make([]taskItem[T], n)
+	}
 }
 
 // taskQueue is the scheduler shared by Queue and Task. run is bound once at
@@ -200,10 +223,12 @@ func newTaskQueue[T any](opts []Option, run func(T)) *taskQueue[T] {
 
 // Len returns the number of tasks queued but not yet started.
 func (q *taskQueue[T]) Len() int {
-	n := q.queue.len()
 	q.mu.Lock()
+	n := q.queue.len()
 	for _, w := range q.workers {
-		n += int(atomic.LoadInt32(&w.held))
+		if held := int32(atomic.LoadUint64(&w.state)); held > 0 {
+			n += int(held)
+		}
 	}
 	q.mu.Unlock()
 	return n
@@ -446,10 +471,11 @@ func (q *taskQueue[T]) spawnLocked() {
 		w = v.(*worker[T])
 	} else {
 		w = &worker[T]{ch: make(chan bool, 1)}
+		w.initBatch(q.opt.maxBatchSize)
 	}
 	q.live++
 	w.index = len(q.workers)
-	w.lastSeq = atomic.LoadUint32(&w.seq)
+	w.lastSeq = uint32(atomic.LoadUint64(&w.state) >> 32)
 	w.stuckTicks = 0
 	q.workers = append(q.workers, w)
 	if q.onSpawnForTest != nil {
@@ -471,25 +497,40 @@ func (q *taskQueue[T]) removeLocked(w *worker[T]) {
 	q.pool.Put(w)
 }
 
-// maxPopBatch caps how many tasks a worker claims at once.
-const maxPopBatch = 8
+const (
+	// batchCooldown is the number of tasks handled singly after a rescue.
+	// Contention can grow batches again once this worker has made progress.
+	batchCooldown  = 64
+	workerSeqStep  = uint64(1) << 32
+	workerHeldMask = workerSeqStep - 1
+	// Rescue markers prevent the owner from reusing a batch while
+	// the monitor returns its unstarted entries to the shared queue.
+	batchRescuing = uint32(1) << 31
+	batchRescued  = batchRescuing | 1
+)
 
 // worker is the main loop of a worker goroutine.
 //
-// It takes one task at a time from the shared queue, so a worker that loses
-// its P never holds tasks another worker could run. Only when workers collide
-// on the queue head, which takes tasks shorter than a CAS round trip, does it
-// claim small batches instead. After each claim it gives up its running slot
-// when more workers run than the target allows.
+// It claims small batches only when workers collide on the queue head. The
+// monitor returns unstarted batch tasks to the shared queue when the owner
+// stops making progress. After a rescue the owner handles tasks singly for
+// a while; after each claim it yields excess running slots as before.
 func (q *taskQueue[T]) worker(w *worker[T]) {
-	var buf [maxPopBatch]taskItem[T]
-	batch, n := 1, 0
+	q.runWorker(w, 1)
+}
+
+func (q *taskQueue[T]) runWorker(w *worker[T], batch int) {
+	maxBatch := q.opt.maxBatchSize
+	if batch > maxBatch {
+		batch = maxBatch
+	}
+	n, cooldown := 0, 0
 	for {
 		limit := batch
 		if q.opt.maxJobs > 0 && q.opt.maxJobs-n < limit {
 			limit = q.opt.maxJobs - n
 		}
-		k, contended := q.queue.popBatch(buf[:limit])
+		k, contended := q.queue.popBatch(w.batch[:limit])
 		if k == 0 {
 			batch = 1
 			switch q.idleWorker(w) {
@@ -502,26 +543,35 @@ func (q *taskQueue[T]) worker(w *worker[T]) {
 			}
 			continue
 		}
-		if contended && batch < maxPopBatch {
-			if batch *= 2; batch > maxPopBatch {
-				batch = maxPopBatch
+		if cooldown > 0 {
+			batch = 1
+		} else if contended && batch < maxBatch {
+			if batch > maxBatch/2 {
+				batch = maxBatch
+			} else {
+				batch *= 2
 			}
 		} else if !contended && batch > 1 {
 			batch--
 		}
-		for j := 0; j < k; j++ {
-			item := buf[j]
-			buf[j] = taskItem[T]{}
-			if k > 1 {
-				atomic.StoreInt32(&w.held, int32(k-1-j))
-			}
-			atomic.AddUint32(&w.seq, 1)
+		completed, rescued := 1, false
+		if k == 1 {
+			item := w.batch[0]
+			w.batch[0] = taskItem[T]{}
+			atomic.AddUint64(&w.state, workerSeqStep)
 			q.exec(item.value)
 			if item.submitted {
 				atomic.AddInt64(&q.pending, -1)
 			}
+		} else {
+			completed, rescued = q.execBatch(w, k)
 		}
-		n += k
+		if rescued {
+			batch, cooldown = 1, batchCooldown
+		} else if cooldown > 0 {
+			cooldown -= completed
+		}
+		n += completed
 		if q.opt.maxJobs > 0 && n >= q.opt.maxJobs {
 			q.recycle(w)
 			return
@@ -535,6 +585,75 @@ func (q *taskQueue[T]) worker(w *worker[T]) {
 			}
 		}
 	}
+}
+
+// execBatch publishes the unstarted tail of a batch. The owner claims each
+// remaining entry with a CAS on its own cache line; the monitor can instead
+// claim the entire tail. No per-task timer or allocation is needed.
+func (q *taskQueue[T]) execBatch(w *worker[T], k int) (completed int, rescued bool) {
+	item := w.batch[0]
+	w.batch[0] = taskItem[T]{}
+	w.batchSize = k
+	state := atomic.LoadUint64(&w.state) &^ workerHeldMask
+	atomic.StoreUint64(&w.state, state+workerSeqStep|uint64(k-1))
+	// A burst smaller than the worker target may not have started a monitor.
+	// Once a batch is held it must remain observable even with an empty FIFO.
+	if atomic.LoadUint32(&q.monitorOn) == 0 {
+		q.startMonitor()
+	}
+	q.exec(item.value)
+	if item.submitted {
+		atomic.AddInt64(&q.pending, -1)
+	}
+	completed = 1
+	for {
+		state := atomic.LoadUint64(&w.state)
+		held := uint32(state)
+		switch held {
+		case 0:
+			return completed, false
+		case batchRescuing:
+			// The monitor owns the tail, but has not finished copying it.
+			runtime.Gosched()
+			continue
+		case batchRescued:
+			atomic.StoreUint64(&w.state, state&^workerHeldMask)
+			return completed, true
+		}
+		if !atomic.CompareAndSwapUint64(&w.state, state, state+workerSeqStep-1) {
+			continue
+		}
+		index := k - int(held)
+		item = w.batch[index]
+		w.batch[index] = taskItem[T]{}
+		q.exec(item.value)
+		if item.submitted {
+			atomic.AddInt64(&q.pending, -1)
+		}
+		completed++
+	}
+}
+
+// rescueBatchLocked returns a stalled worker's unstarted tasks to the FIFO.
+// Holding mu keeps Len and worker retirement out of the ownership transfer.
+// observed is the monitor's original sample: the owner can advance without
+// mu, so claiming a newer state would apply old stall samples to a new task.
+func (q *taskQueue[T]) rescueBatchLocked(w *worker[T], observed uint64) int {
+	if w.stuckTicks < batchRescueTicks || q.opt.maxBatchSize <= 1 || q.opt.concurrency <= 1 {
+		return 0
+	}
+	held := int32(observed)
+	if held <= 0 || !atomic.CompareAndSwapUint64(&w.state, observed, observed&^workerHeldMask|uint64(batchRescuing)) {
+		return 0
+	}
+	first := w.batchSize - int(held)
+	q.queue.pushN(int(held), func(i int) taskItem[T] {
+		item := w.batch[first+i]
+		w.batch[first+i] = taskItem[T]{}
+		return item
+	})
+	atomic.StoreUint64(&w.state, observed&^workerHeldMask|uint64(batchRescued))
+	return int(held)
 }
 
 func (q *taskQueue[T]) exec(value T) {
@@ -723,25 +842,35 @@ func (q *taskQueue[T]) monitor() {
 		time.Sleep(monitorTick)
 		lateness := time.Since(start) - monitorTick
 
-		backlog := int64(q.queue.len())
-		stuck, progress := int64(0), int64(0)
+		stuck, progress, held := int64(0), int64(0), int64(0)
 		q.mu.Lock()
 		for _, w := range q.workers {
 			if w.parked {
 				w.stuckTicks = 0
 				continue
 			}
-			if seq := atomic.LoadUint32(&w.seq); seq != w.lastSeq {
+			state := atomic.LoadUint64(&w.state)
+			if seq := uint32(state >> 32); seq != w.lastSeq {
 				progress += int64(seq - w.lastSeq)
 				w.lastSeq = seq
 				w.stuckTicks = 0
 			} else if w.stuckTicks++; w.stuckTicks >= stuckTicks {
 				stuck++
+				if w.stuckTicks >= batchRescueTicks && q.opt.maxBatchSize > 1 &&
+					q.opt.concurrency > 1 && int32(state) > 0 {
+					q.rescueBatchLocked(w, state)
+					state = atomic.LoadUint64(&w.state)
+				}
+			}
+			if remaining := int32(state); remaining > 0 {
+				held += int64(remaining)
 			}
 		}
 		base := q.base
 		stopped := q.stopped
 		q.mu.Unlock()
+		queued := int64(q.queue.len())
+		backlog := queued + held
 
 		extra := q.extra
 		running := atomic.LoadInt64(&q.running)
@@ -804,8 +933,8 @@ func (q *taskQueue[T]) monitor() {
 		}
 		q.extra = extra
 		atomic.StoreInt64(&q.target, base+extra)
-		if backlog > 0 && atomic.LoadInt64(&q.running) < base+extra {
-			q.dispatch(int(backlog))
+		if queued > 0 && atomic.LoadInt64(&q.running) < base+extra {
+			q.dispatch(int(queued))
 		}
 
 		if backlog > 0 {
@@ -819,12 +948,17 @@ func (q *taskQueue[T]) monitor() {
 		atomic.StoreInt64(&q.target, base)
 		atomic.StoreUint32(&q.throttle, 0)
 		q.queue.shrink(ringKeep)
-		atomic.StoreUint32(&q.monitorOn, 0)
-		// A submitter that saw the monitor still running did not start
-		// another one; look once more before leaving.
-		if q.queue.ready() && !stopped {
-			q.startMonitor()
-		}
+		q.finishMonitor()
 		return
+	}
+}
+
+func (q *taskQueue[T]) finishMonitor() {
+	atomic.StoreUint32(&q.monitorOn, 0)
+	// A submitter or batch owner may have observed the old monitor just
+	// before it stopped. Recheck both the FIFO and held tails after clearing
+	// the flag, including during Stop while accepted work remains.
+	if q.Len() > 0 {
+		q.startMonitor()
 	}
 }

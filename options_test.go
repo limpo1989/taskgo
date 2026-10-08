@@ -24,7 +24,8 @@ import (
 func TestOptionDefaults(t *testing.T) {
 	o := newOptions(nil)
 	if o.concurrency != defaultConcurrency || o.timeout != defaultTimeout ||
-		o.maxIdle != 0 || o.maxJobs != 0 || o.maxPending != defaultMaxPending || o.nowFn == nil {
+		o.maxIdle != 0 || o.maxJobs != 0 || o.maxPending != defaultMaxPending ||
+		o.maxBatchSize != defaultMaxBatchSize || o.nowFn == nil {
 		t.Fatalf("unexpected defaults: %+v", o)
 	}
 }
@@ -36,6 +37,7 @@ func TestOptionNegativeNormalization(t *testing.T) {
 		WithMaxIdle(-time.Second),
 		WithMaxJobs(-5),
 		WithMaxPending(-7),
+		WithMaxBatchSize(-3),
 	})
 	if o.concurrency != defaultConcurrency {
 		t.Fatalf("concurrency = %d", o.concurrency)
@@ -52,6 +54,9 @@ func TestOptionNegativeNormalization(t *testing.T) {
 	if o.maxPending != 0 {
 		t.Fatalf("maxPending = %d", o.maxPending)
 	}
+	if o.maxBatchSize != defaultMaxBatchSize {
+		t.Fatalf("maxBatchSize = %d", o.maxBatchSize)
+	}
 }
 
 func TestOptionSetters(t *testing.T) {
@@ -60,12 +65,32 @@ func TestOptionSetters(t *testing.T) {
 		WithMaxIdle(5 * time.Second),
 		WithMaxJobs(100),
 		WithMaxPending(200),
+		WithMaxBatchSize(16),
 		WithTimeout(2 * time.Second),
 		WithPanicHandler(func(any) {}),
 	})
 	if o.concurrency != 3 || o.maxIdle != 5*time.Second || o.maxJobs != 100 || o.maxPending != 200 ||
-		o.timeout != 2*time.Second || o.panicFn == nil {
+		o.maxBatchSize != 16 || o.timeout != 2*time.Second || o.panicFn == nil {
 		t.Fatalf("unexpected: %+v", o)
+	}
+}
+
+func TestMaxBatchSizeNormalization(t *testing.T) {
+	cases := []struct{ value, want int }{
+		{0, defaultMaxBatchSize},
+		{-1, defaultMaxBatchSize},
+		{1, 1},
+		{3, 3},
+		{16, 16},
+		{maxSupportedBatchSize, maxSupportedBatchSize},
+	}
+	if maxInt := int(^uint(0) >> 1); maxInt > maxSupportedBatchSize {
+		cases = append(cases, struct{ value, want int }{maxInt, defaultMaxBatchSize})
+	}
+	for _, tc := range cases {
+		if got := newOptions([]Option{WithMaxBatchSize(tc.value)}).maxBatchSize; got != tc.want {
+			t.Errorf("WithMaxBatchSize(%d): got %d, want %d", tc.value, got, tc.want)
+		}
 	}
 }
 

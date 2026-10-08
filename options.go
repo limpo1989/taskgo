@@ -22,22 +22,25 @@ import (
 )
 
 const (
-	defaultConcurrency = 8
-	defaultMaxIdle     = 0 // 0 means no parking: a worker exits once the queue drains
-	defaultMaxJobs     = 0 // 0 means no per-worker task limit
-	defaultMaxPending  = 0 // 0 means Submit is not admission-limited
-	defaultTimeout     = 30 * time.Second
-	minBacklogCapacity = 8
-	maxBacklogCapacity = 128
+	defaultConcurrency    = 8
+	defaultMaxIdle        = 0 // 0 means no parking: a worker exits once the queue drains
+	defaultMaxJobs        = 0 // 0 means no per-worker task limit
+	defaultMaxPending     = 0 // 0 means Submit is not admission-limited
+	defaultMaxBatchSize   = 8
+	maxSupportedBatchSize = 1<<31 - 1 // the low state word holds a signed task count
+	defaultTimeout        = 30 * time.Second
+	minBacklogCapacity    = 8
+	maxBacklogCapacity    = 128
 )
 
 type options struct {
-	concurrency int           // maximum number of concurrent workers
-	maxIdle     time.Duration // how long a worker may stay parked; <=0 disables parking
-	maxJobs     int           // task count after which a worker is recycled; <=0 means no limit
-	maxPending  int           // maximum outstanding Submit jobs; <=0 means no limit
-	timeout     time.Duration // how long Stop waits for outstanding tasks
-	panicFn     func(v any)   // task panic handler; when non-nil, panics are recovered
+	concurrency  int           // maximum number of concurrent workers
+	maxIdle      time.Duration // how long a worker may stay parked; <=0 disables parking
+	maxJobs      int           // task count after which a worker is recycled; <=0 means no limit
+	maxPending   int           // maximum outstanding Submit jobs; <=0 means no limit
+	maxBatchSize int           // maximum tasks claimed together; 1 disables batching and rescue
+	timeout      time.Duration // how long Stop waits for outstanding tasks
+	panicFn      func(v any)   // task panic handler; when non-nil, panics are recovered
 
 	// The following are unexported test hooks.
 	nowFn         func() time.Time // time source, letting tests control janitor decisions
@@ -50,11 +53,12 @@ type Option func(o *options)
 // newOptions applies opts on top of the defaults and normalizes invalid values.
 func newOptions(opts []Option) *options {
 	o := &options{
-		concurrency: defaultConcurrency,
-		maxIdle:     defaultMaxIdle,
-		maxJobs:     defaultMaxJobs,
-		maxPending:  defaultMaxPending,
-		timeout:     defaultTimeout,
+		concurrency:  defaultConcurrency,
+		maxIdle:      defaultMaxIdle,
+		maxJobs:      defaultMaxJobs,
+		maxPending:   defaultMaxPending,
+		maxBatchSize: defaultMaxBatchSize,
+		timeout:      defaultTimeout,
 	}
 	for _, f := range opts {
 		f(o)
@@ -73,6 +77,9 @@ func newOptions(opts []Option) *options {
 	}
 	if o.maxPending < 0 {
 		o.maxPending = 0
+	}
+	if o.maxBatchSize <= 0 || o.maxBatchSize > maxSupportedBatchSize {
+		o.maxBatchSize = defaultMaxBatchSize
 	}
 	if o.nowFn == nil {
 		o.nowFn = time.Now
@@ -113,6 +120,18 @@ func backlogCapacityHint(workerTarget int) int {
 // n, while tasks wait behind workers that block.
 func WithConcurrency(n int) Option {
 	return func(o *options) { o.concurrency = n }
+}
+
+// WithMaxBatchSize sets the maximum number of tasks a worker claims at once.
+// The default is 8. Workers start with one task and grow their batches under
+// queue-head contention, up to n. It applies to Queue and Task, independently
+// of how many values are submitted with PushBatch or SubmitBatch.
+//
+// Setting n to 1 disables batching and stalled-batch rescue. The monitor still
+// compensates for blocked workers. Values outside [1, 2^31-1] use the default.
+// Batch buffers are allocated once per worker and reused.
+func WithMaxBatchSize(n int) Option {
+	return func(o *options) { o.maxBatchSize = n }
 }
 
 // WithMaxIdle sets how long an idle worker stays parked before exiting.
