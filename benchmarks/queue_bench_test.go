@@ -149,41 +149,39 @@ func workloads() []workload {
 }
 
 // typedPool drives Task[int]. The task function is bound once when the pool is
-// created; submitBatch only passes integer values and waits on a shared channel
-// for completion. This keeps the benchmark from reintroducing one closure per
-// submitted value.
+// created; submitBatch only passes integer values. Completion is counted with
+// a WaitGroup, exactly as the closure path's submitBatch does, so the two
+// differ only in one closure per submitted value against a bound function and
+// a direct value push.
 type typedPool interface {
 	submitBatch(n int)
 	stop()
 }
 
 type taskgoTypedPool struct {
-	q    *taskgo.Task[int]
-	work func()
-	done chan struct{}
+	q  *taskgo.Task[int]
+	wg sync.WaitGroup
 }
 
 func newTaskgoTypedPool(concurrency int, reuse bool, work func()) *taskgoTypedPool {
-	p := &taskgoTypedPool{work: work}
+	p := &taskgoTypedPool{}
 	opts := []taskgo.Option{taskgo.WithConcurrency(concurrency)}
 	if reuse {
 		opts = append(opts, taskgo.WithMaxIdle(time.Second))
 	}
 	p.q = taskgo.NewTask(func(int) {
-		p.work()
-		p.done <- struct{}{}
+		work()
+		p.wg.Done()
 	}, opts...)
 	return p
 }
 
 func (p *taskgoTypedPool) submitBatch(n int) {
-	p.done = make(chan struct{}, n)
+	p.wg.Add(n)
 	for i := 0; i < n; i++ {
 		p.q.Push(i)
 	}
-	for i := 0; i < n; i++ {
-		<-p.done
-	}
+	p.wg.Wait()
 }
 
 func (p *taskgoTypedPool) stop() { _ = p.q.Stop(context.Background()) }

@@ -27,6 +27,11 @@ as a resident pool: a worker is reclaimed once it has been idle longer than
   never takes a lock or blocks while workers are busy, and about `GOMAXPROCS`
   workers run until tasks block, instead of flooding the Go scheduler.
 - Graceful shutdown that drains outstanding work, with a deadline.
+- Optional keyed ingress (`NewTaskKeyed`): a task lands on the
+  FIFO of `key(task) % shards`, so the tasks of one key stay with one worker,
+  and so on one CPU, while a worker serves their shard; a shard left without
+  a worker is handed over, trading strict per-key order for progress behind a
+  blocked task.
 - Optional panic handler so a panicking task cannot crash the process.
 
 ## Install
@@ -43,6 +48,7 @@ type Task[T any] struct { ... }
 
 func New(opts ...Option) *Queue
 func NewTask[T any](fn func(T), opts ...Option) *Task[T]
+func NewTaskKeyed[T any](fn func(T), key func(T) uint32, shards int, opts ...Option) *Task[T]
 
 func (q *Queue) Push(job Job)               // submit a task (nil is ignored)
 func (q *Queue) PushBatch(jobs []Job) int    // submit jobs, return accepted count
@@ -69,6 +75,17 @@ func WithMaxPending(n int) Option            // bound outstanding Submit jobs (d
 func WithTimeout(d time.Duration) Option     // how long Stop waits (default 30s)
 func WithPanicHandler(fn func(v any)) Option // recover task panics
 ```
+
+`NewTaskKeyed` (new in v1.7.0, see "How it works") spreads a keyed queue's
+ingress over one FIFO per shard. A worker serves the shard it served last and
+takes over other shards once its own runs dry; a shard left without a worker,
+because its worker blocks in a task or because there are more shards than
+workers, is handed over after a few watches. `shards <= 1` or a nil key makes
+the plain single-FIFO queue `NewTask` makes. Order holds only within a shard,
+and only while one worker serves it: after a handover, a shard's tasks can
+run on a second worker, concurrently with the blocked task that triggered the
+handover. `key` runs once per value before the queue admits it — a stopped
+queue runs no key at all.
 
 ## Example
 
@@ -199,6 +216,24 @@ ordered run, claiming consecutive queue slots with a single CAS where they fit.
 without blocking once `n` running or queued submissions are outstanding;
 legacy `Push` remains unbounded for compatibility.
 
+A keyed queue (`NewTaskKeyed`) adds one FIFO per shard and sends each value to
+the FIFO of `key(value) % shards`. A worker serves the shard it served last,
+taking its tasks in submission order, and moves to the shard of a rotating
+scan only once its own runs dry, so the tasks of one key normally keep
+running on one worker, and so on one CPU. A shard can be left without a
+worker - its worker blocks in a task, or there are more shards than workers
+and none of theirs runs dry - so the monitor watches for it: a shard whose
+head has not moved for a few ticks while it holds tasks, and the shard of a
+worker stuck in one task, are marked and taken over by the next worker that
+looks. Workers keep watch as they take tasks, so the handover stays timely
+while the monitor's own ticks are delayed. Order holds only within a shard,
+and only while one worker serves it: after a handover, tasks claimed from
+that shard in submission order can run on a second worker, concurrently with
+the blocked task that triggered the handover. Not starving the tasks behind a
+blocked one is the stronger promise here; strict per-key serialization is
+not. Tasks of different shards are not ordered, and a batch is split over the
+shards its values pick.
+
 ## Tuning
 
 - **`WithMaxBatchSize` bounds worker claims**, independently of submission
@@ -227,159 +262,6 @@ legacy `Push` remains unbounded for compatibility.
   Size it for the most tasks you expect to be blocked at once.
 - Without `WithPanicHandler`, a panicking task propagates and crashes the
   process. Set it for untrusted tasks.
-
-## Benchmarks
-
-Measured on a Mac (Apple M4 Pro, 12 logical CPUs, Go 1.27.1) with
-`GOMAXPROCS=12`, comparing two taskgo modes on identical workloads:
-
-- **NoReuse**: `WithConcurrency(c)` (parking off).
-- **Reuse**: `WithConcurrency(c)` + `WithMaxIdle(time.Second)`.
-
-Two task shapes are used: **Deep** (a ~256-frame call chain that forces stack
-growth) and **Shallow** (`fib(10)`, stacks never grow). Pool teardown is
-excluded from timing. Numbers are average wall time per operation, the median
-of three runs; lower is better.
-
-### Bursty load, `WithConcurrency(48)`
-
-Each operation submits 2,000 batches of 48 tasks and waits for each batch, so
-the queue drains and the workers go idle between batches.
-
-| Workload | Reuse | NoReuse |
-|---|---:|---:|
-| Deep | **63.4 ms** | 125.6 ms |
-| Shallow | **30.5 ms** | 38.8 ms |
-
-Parked workers keep their grown stacks, so deep-stack bursts run **2× faster**
-with Reuse, and shallow bursts take 21% less time. Reuse also allocates less:
-2.34 MB per operation, against 3.10 MB (Deep) and 3.42 MB (Shallow) without it.
-
-### Sustained saturation, `WithConcurrency(48)`
-
-Each operation submits 100,000 tasks at once, so the queue stays full and the
-workers run tasks back to back.
-
-| Workload | Reuse | NoReuse |
-|---|---:|---:|
-| Deep | 22.1 ms | 22.4 ms |
-| Shallow | 7.30 ms | 7.36 ms |
-
-The queue drains only at the end of each operation, so workers in both modes
-keep their stacks for almost every task, and the two perform the same.
-
-### High concurrency limit, `WithConcurrency(10000)`
-
-Each operation submits the given number of tasks at once and waits for them.
-
-| Load | Deep, Reuse | Deep, NoReuse | Shallow, Reuse | Shallow, NoReuse |
-|---|---:|---:|---:|---:|
-| 1,000 | **0.274 ms** | 0.296 ms | 0.101 ms | 0.102 ms |
-| 10,000 | 2.27 ms | 2.29 ms | 0.774 ms | 0.783 ms |
-| 100,000 | 22.1 ms | 22.0 ms | 7.39 ms | 7.39 ms |
-| 500,000 | 109.1 ms | 109.5 ms | 36.9 ms | 36.6 ms |
-
-About `GOMAXPROCS` workers run tasks whatever the limit, so NoReuse has few
-stacks to regrow per operation, and the two modes stay within 8% of each other
-at every load.
-
-### Typed task path
-
-The same scenarios with `Task[int]`, whose task function is bound once. Each
-task signals completion on a shared channel rather than a `sync.WaitGroup`, so
-these times include that channel traffic and are not comparable with the
-tables above.
-
-| Scenario | Task-Reuse | Task-NoReuse |
-|---|---:|---:|
-| Burst, Deep | **77.5 ms** | 125.8 ms |
-| Burst, Shallow | **32.4 ms** | 37.7 ms |
-| Saturated, Deep | 41.3 ms | 40.5 ms |
-| Saturated, Shallow | 21.4 ms | 21.4 ms |
-
-With `WithConcurrency(10000)` the two modes are within 5% of each other at
-every load: Deep tasks take 0.44/0.46 ms at 1K, 4.11/4.12 ms at 10K,
-41.2/41.1 ms at 100K and 204.5/203.8 ms at 500K for Reuse/NoReuse.
-
-### Concurrent producers
-
-16 producers push shallow tasks into one `WithConcurrency(48)` queue as fast as
-they can. Time per task:
-
-| Path | Reuse | NoReuse |
-|---|---:|---:|
-| `Queue` (a closure per task) | 211 ns | **174 ns** |
-| `Task[int]` | 137 ns | **104 ns** |
-
-Reuse costs 22–32% more per task here: the workers keep catching up with the
-producers and going idle, and shallow tasks leave no grown stacks to reuse.
-This is the shallow workload the Tuning section suggests running without
-`WithMaxIdle`.
-
-### Latency gates
-
-The tail gate drives 24 producers, 10,000 tasks in flight and a 25 µs CPU task
-through `WithConcurrency(10000)`, 2M tasks in total (`GOMAXPROCS=12`). The CPU
-is saturated, so by Little's law the mean wait is about 20 ms; the gate checks
-how evenly that wait is spread. Latency is measured from submission to task
-start, median of three runs:
-
-| Submission | p50 | p99 | p99.9 | max |
-|---|---:|---:|---:|---:|
-| batch32 | 18.8 ms | 48.1 ms | 137.4 ms | 408.3 ms |
-| batch1 | 20.1 ms | 27.4 ms | 28.7 ms | 54.6 ms |
-
-The batch32 maximum varied between 322 and 640 ms from run to run.
-
-The stall gates check that blocked workers do not hold up other tasks. With
-1,000 fast tasks submitted while 11, 12 (the base worker target at
-`GOMAXPROCS=12`), 256, 1,000 or 5,000 workers are blocked, fast-task P99 is
-0.02, 2.6, 2.2, 2.3 and 1.0 ms. When the fast tasks queue behind 256, 1,000 or
-5,000 blocking tasks that have not started yet, they need that many workers
-first, and their P99 is 7.1, 11.8 and 17.9 ms.
-
-Reproduce with:
-
-```sh
-GOMAXPROCS=12 TASKGO_RUN_TAIL_REPRO=1 TASKGO_TAIL_TOTAL=2000000 \
-go test -run '^TestTailLatencyReproduction$' -count=1 -v
-
-GOMAXPROCS=12 TASKGO_RUN_STALL_REPRO=1 TASKGO_RUN_STALL_BURST_REPRO=1 \
-go test -run '^TestStall(Burst)?LatencyReproduction$' -count=1 -v
-```
-
-The scheduling benchmarks live in their own module under `benchmarks/`:
-
-```
-cd benchmarks
-GOMAXPROCS=12 go test -run '^$' -bench 'Benchmark(Burst|Saturated)/.*/taskgo-(NoReuse|Reuse)$' -benchmem -count=3
-GOMAXPROCS=12 go test -run '^$' -bench 'BenchmarkHighConcurrency/.*/.*/taskgo-(NoReuse|Reuse)$' -benchmem -count=3
-GOMAXPROCS=12 go test -run '^$' -bench 'BenchmarkTyped(Burst|Saturated)/.*/taskgo-Task-(NoReuse|Reuse)$' -benchmem -count=3
-GOMAXPROCS=12 go test -run '^$' -bench 'BenchmarkTypedHighConcurrency/.*/.*/taskgo-Task-(NoReuse|Reuse)$' -benchmem -count=3
-GOMAXPROCS=12 go test -run '^$' -bench 'BenchmarkConcurrentProducers' -benchmem -count=3
-```
-
-The typed-versus-closure submission benchmark is part of the main module:
-
-```sh
-GOMAXPROCS=12 go test -run '^$' -bench 'BenchmarkPush(Closure|Typed)$' -benchmem
-```
-
-`BenchmarkPushTyped` reports 0 allocations at 240 ns/op; `BenchmarkPushClosure`,
-which captures the same value in a closure, reports one 24-byte allocation at
-255 ns/op.
-
-The real-time sawtooth, long-tail, and max-idle experiments depend on OS timer
-resolution, CPU capacity, scheduler load, and race instrumentation. They are
-opt-in so ordinary cross-platform unit tests do not assert statistical ordering
-between different machines:
-
-```sh
-TASKGO_RUN_EXPERIMENTS=1 go test -v -run 'TestSawtoothMitigations|TestLongTailMitigations|TestHeavyTailCap|TestMaxIdleSweep'
-```
-
-`TestSawtoothJitter` uses a simulated clock and remains part of the default
-deterministic test suite.
 
 ## License
 

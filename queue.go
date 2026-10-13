@@ -27,6 +27,7 @@ package taskgo
 
 import (
 	"context"
+	"math/bits"
 	"runtime"
 	"sync"
 	"sync/atomic"
@@ -95,6 +96,29 @@ type taskItem[T any] struct {
 	submitted bool // admitted by Submit; releases a pending slot when done
 }
 
+// watchEvery is how many batch attempts a keyed worker makes between looks at
+// whether a watch of the shards is due. Workers take the watch over when the
+// monitor is late: while as many busy workers as there are Ps keep every P,
+// the monitor's ticks wait for one, and 48 workers on 48 Ps left it 45 ticks
+// a second, so a shard without a worker waited over 100ms to be handed over.
+const watchEvery = 64
+
+// orphanStaleWatches is how many watches, about a millisecond apart, a keyed
+// shard may hold tasks without any worker taking one before it is handed
+// over. Shards go unattended for a while all the time: a worker serves its
+// own shard until it runs dry and only then takes over another, so in a burst
+// over more shards than workers the others wait their turn. That wait is what
+// keeps a key's tasks on one CPU, and the threshold sits above it: on a
+// saturated echo server with 48 shards and 24 workers, handing shards over
+// after 5 watches cost 6% of its throughput, after 50 nothing measurable.
+const orphanStaleWatches = 50
+
+// shardBatch is the stack room shardIndexes has for a batch before it
+// allocates.
+const shardBatch = 64
+
+var monoEpoch = time.Now()
+
 const (
 	// monitorTick is the period of the monitor that runs while tasks are
 	// waiting for a worker.
@@ -144,12 +168,21 @@ type worker[T any] struct {
 
 	ch chan bool // wake-up (false) or exit (true) while parked; buffered 1
 
+	// Keyed queues only, and owned by the worker goroutine, except that the
+	// monitor reads ring, atomically, to hand a stuck worker's shard over.
+	ring      int32 // atomic
+	pops      uint32
+	scans     uint32
+	seed      uint32
+	claimTick uint32
+
 	// Guarded by taskQueue.mu.
 	lastUsed   time.Time
 	parked     bool
 	index      int    // position in taskQueue.workers
 	lastSeq    uint32 // seq seen at the monitor's previous tick
 	stuckTicks int
+	stuckHead  uint64 // keyed: dequeues of the worker's shard at the previous stuck tick
 }
 
 // initBatch keeps the default-size buffer inside the control block. Larger
@@ -191,12 +224,33 @@ type taskQueue[T any] struct {
 	base      int64 // target without the monitor's compensation
 	monitorOn uint32
 	throttle  uint32 // atomic: submitters yield after submitting; see throttleBacklog
+	// Keyed queues only. orphans counts the bits set in orphaned, one per
+	// shard found unattended; every pop reads it. ticks counts the watches,
+	// all of them, and paces the claims; monTicks counts the monitor's own
+	// iterations, which pace the stuck detection while idle workers watch
+	// too. watching is held by the goroutine running one watch, and watchNext
+	// is when the next one is due.
+	orphans   int32  // atomic
+	ticks     uint32 // atomic: every watch's pace, for the orphan claims
+	monTicks  uint32 // atomic: the monitor's own pace, for the stuck detection
+	watching  uint32 // atomic
+	_         uint32
+	watchNext int64 // atomic: monoNow nanoseconds
 	_         [cacheLinePad - 24]byte
 
-	queue lfQueue[taskItem[T]]
+	queue lfQueue[taskItem[T]] // the ingress when shards <= 1
+	// Keyed ingress (see NewTaskKeyed): one FIFO per shard, plus the fields
+	// that watch for shards left without a worker.
+	rings    []lfQueue[taskItem[T]]
+	orphaned []uint64 // atomic bits: unattended shards
+	heads    []uint64 // guarded by watching: dequeues at the last watch
+	stale    []uint8  // guarded by watching: watches without progress
+	shards   int
+	keyFn    func(T) uint32
 
 	mu             sync.Mutex
 	live           int          // live workers, at most opt.concurrency
+	spawned        uint32       // workers ever started, seeding keyed scans
 	idle           []*worker[T] // parked workers, most recently parked last
 	workers        []*worker[T] // every live worker, scanned by the monitor
 	stopped        bool
@@ -212,19 +266,84 @@ type taskQueue[T any] struct {
 }
 
 func newTaskQueue[T any](opts []Option, run func(T)) *taskQueue[T] {
+	return newShardedTaskQueue(opts, run, nil, 0)
+}
+
+// newShardedTaskQueue is newTaskQueue with its ingress spread over shards
+// FIFOs by key, or a single FIFO when shards <= 1.
+func newShardedTaskQueue[T any](opts []Option, run func(T), key func(T) uint32, shards int) *taskQueue[T] {
 	o := newOptions(opts)
-	q := &taskQueue[T]{opt: o, run: run}
+	q := &taskQueue[T]{opt: o, run: run, keyFn: key, shards: shards}
 	base := int64(autoWorkerLimit(o.concurrency))
 	q.base = base
 	q.target = base
-	q.queue.init(backlogCapacityHint(int(base)))
+	q.initQueues(backlogCapacityHint(int(base)))
 	return q
+}
+
+// NewTaskKeyed creates a typed task queue whose ingress is spread over shards
+// FIFOs keyed by key: a task lands on the FIFO of key(task) % shards. A worker
+// keeps taking from the shard it served last and moves to another only when
+// that one runs dry, so the tasks of one key stay with one worker - and so on
+// one CPU - while a worker serves their shard, and workers that run out of
+// work take over the shards still holding tasks.
+//
+// When no worker runs out of work, a shard can be left without one: its
+// worker blocks in a task, or there are more shards than running workers.
+// The monitor hands such a shard to another worker once it has held tasks
+// for batchRescueTicks ticks in which no worker took one, the patience the
+// held batch rescue has. A queued task therefore waits behind a blocked task
+// about that long, a few milliseconds, where the single FIFO lets any other
+// worker take it at once.
+//
+// Order holds only within a shard, and only while one worker serves it.
+// Tasks of one key are claimed in submission order but may still overlap
+// with more than one worker: after a handover, a task runs on another worker
+// while the blocked task that triggered the handover is still in flight. And
+// tasks of different shards are not ordered at all: unlike NewTask's queue,
+// even WithConcurrency(1) runs them shard by shard rather than in submission
+// order, and a batch is split over the shards its values pick.
+//
+// key must be cheap and return the same value for a value every time. It runs
+// once per value, before the queue admits it: a key that panics leaves
+// nothing admitted, a whole batch included. A stopped queue runs no key at
+// all: Push, PushBatch and Submit reject before it, and the batch methods
+// already did. Each shard's FIFO is allocated up front. shards <= 1, or a nil key, makes the plain single-FIFO queue NewTask
+// makes. fn must be non-nil.
+func NewTaskKeyed[T any](fn func(T), key func(T) uint32, shards int, opts ...Option) *Task[T] {
+	if fn == nil {
+		panic("taskgo: nil task function")
+	}
+	if key == nil || shards <= 1 {
+		key, shards = nil, 0
+	}
+	return &Task[T]{taskQueue: newShardedTaskQueue(opts, fn, key, shards)}
+}
+
+// initQueues sizes the ingress queues: one FIFO when unkeyed, shards of them
+// when a key function was given (see NewTaskKeyed).
+func (q *taskQueue[T]) initQueues(hint int) {
+	if q.shards > 1 {
+		per := hint / q.shards
+		if per < 1024 {
+			per = 1024
+		}
+		q.rings = make([]lfQueue[taskItem[T]], q.shards)
+		for i := range q.rings {
+			q.rings[i].init(per)
+		}
+		q.orphaned = make([]uint64, (q.shards+63)/64)
+		q.heads = make([]uint64, q.shards)
+		q.stale = make([]uint8, q.shards)
+		return
+	}
+	q.queue.init(hint)
 }
 
 // Len returns the number of tasks queued but not yet started.
 func (q *taskQueue[T]) Len() int {
 	q.mu.Lock()
-	n := q.queue.len()
+	n := q.lenAny()
 	for _, w := range q.workers {
 		if held := int32(atomic.LoadUint64(&w.state)); held > 0 {
 			n += int(held)
@@ -296,7 +415,7 @@ func (q *taskQueue[T]) Stop(ctx context.Context) error {
 }
 
 func (q *taskQueue[T]) finished() bool {
-	return q.queue.len() == 0 && atomic.LoadInt64(&q.running) == 0
+	return q.lenAny() == 0 && atomic.LoadInt64(&q.running) == 0
 }
 
 func (q *taskQueue[T]) isStopped() bool {
@@ -320,10 +439,17 @@ func (q *taskQueue[T]) leave() {
 }
 
 func (q *taskQueue[T]) push(item taskItem[T]) bool {
+	// A stopped keyed queue runs no key: the submission is rejected before
+	// the callback, and enter below still guards the stop race. An unkeyed
+	// queue has no key to protect and enter alone rejects it.
+	if q.shards > 1 && q.isStopped() {
+		return false
+	}
+	shard := q.shardIndex(item.value)
 	if !q.enter() {
 		return false
 	}
-	q.queue.push(item)
+	q.pushItem(item, shard)
 	q.dispatch(1)
 	q.leave()
 	return true
@@ -332,12 +458,31 @@ func (q *taskQueue[T]) push(item taskItem[T]) bool {
 // pushValues enqueues values in order. With submitted set, the caller has
 // already reserved one pending slot per value.
 func (q *taskQueue[T]) pushValues(values []T, submitted bool) int {
-	if len(values) == 0 || !q.enter() {
+	if len(values) == 0 {
 		return 0
 	}
-	q.queue.pushN(len(values), func(i int) taskItem[T] {
-		return taskItem[T]{value: values[i], submitted: submitted}
-	})
+	// A stopped keyed queue runs no key: the batch is rejected before the
+	// callbacks, and enter below still guards the stop race.
+	if q.shards > 1 && q.isStopped() {
+		return 0
+	}
+	var shards []uint32
+	if q.shards > 1 {
+		var buf [shardBatch]uint32
+		shards = q.shardIndexes(values, &buf)
+	}
+	if !q.enter() {
+		return 0
+	}
+	if shards != nil {
+		for i, v := range values {
+			q.pushItem(taskItem[T]{value: v, submitted: submitted}, shards[i])
+		}
+	} else {
+		q.queue.pushN(len(values), func(i int) taskItem[T] {
+			return taskItem[T]{value: values[i], submitted: submitted}
+		})
+	}
 	q.dispatch(len(values))
 	q.leave()
 	return len(values)
@@ -347,13 +492,22 @@ func (q *taskQueue[T]) submit(value T) bool {
 	if q.opt.maxPending <= 0 {
 		return q.push(taskItem[T]{value: value})
 	}
+	// A stopped keyed queue runs no key: the submission is rejected before
+	// the callback, and reservePending below still guards the stop race.
+	if q.shards > 1 && q.isStopped() {
+		return false
+	}
+	shard := q.shardIndex(value)
 	if q.reservePending(1, true) == 0 {
 		return false
 	}
-	if !q.push(taskItem[T]{value: value, submitted: true}) {
+	if !q.enter() {
 		atomic.AddInt64(&q.pending, -1)
 		return false
 	}
+	q.pushItem(taskItem[T]{value: value, submitted: true}, shard)
+	q.dispatch(1)
+	q.leave()
 	return true
 }
 
@@ -366,17 +520,35 @@ func (q *taskQueue[T]) submitBatch(values []T, atomicBatch bool) (accepted int, 
 	}
 	accepted = len(values)
 	submitted := q.opt.maxPending > 0
+	// The key runs before the reservation below, so a key that panics leaves
+	// nothing admitted, the whole batch included.
+	var shards []uint32
+	if q.shards > 1 {
+		var buf [shardBatch]uint32
+		shards = q.shardIndexes(values, &buf)
+	}
 	if submitted {
 		if accepted = q.reservePending(len(values), atomicBatch); accepted == 0 {
 			return 0, false
 		}
 	}
-	if q.pushValues(values[:accepted], submitted) == 0 {
+	if !q.enter() {
 		if submitted {
 			atomic.AddInt64(&q.pending, -int64(accepted))
 		}
 		return 0, false
 	}
+	if shards != nil {
+		for i := 0; i < accepted; i++ {
+			q.pushItem(taskItem[T]{value: values[i], submitted: submitted}, shards[i])
+		}
+	} else {
+		q.queue.pushN(accepted, func(i int) taskItem[T] {
+			return taskItem[T]{value: values[i], submitted: submitted}
+		})
+	}
+	q.dispatch(accepted)
+	q.leave()
 	return accepted, accepted == len(values)
 }
 
@@ -473,6 +645,11 @@ func (q *taskQueue[T]) spawnLocked() {
 		w = &worker[T]{ch: make(chan bool, 1)}
 		w.initBatch(q.opt.maxBatchSize)
 	}
+	if q.shards > 1 {
+		w.seed = q.spawned * 0x9e3779b9
+		atomic.StoreInt32(&w.ring, int32(w.seed%uint32(q.shards)))
+	}
+	q.spawned++
 	q.live++
 	w.index = len(q.workers)
 	w.lastSeq = uint32(atomic.LoadUint64(&w.state) >> 32)
@@ -530,7 +707,7 @@ func (q *taskQueue[T]) runWorker(w *worker[T], batch int) {
 		if q.opt.maxJobs > 0 && q.opt.maxJobs-n < limit {
 			limit = q.opt.maxJobs - n
 		}
-		k, contended := q.queue.popBatch(w.batch[:limit])
+		k, contended := q.popWorkerBatch(w, w.batch[:limit])
 		if k == 0 {
 			batch = 1
 			switch q.idleWorker(w) {
@@ -646,14 +823,305 @@ func (q *taskQueue[T]) rescueBatchLocked(w *worker[T], observed uint64) int {
 	if held <= 0 || !atomic.CompareAndSwapUint64(&w.state, observed, observed&^workerHeldMask|uint64(batchRescuing)) {
 		return 0
 	}
+	// The batch was popped from the worker's shard (see popWorkerBatch), and
+	// that shard does not change while the batch is held, so the tail goes
+	// back there.
+	shard := uint32(atomic.LoadInt32(&w.ring))
 	first := w.batchSize - int(held)
-	q.queue.pushN(int(held), func(i int) taskItem[T] {
+	for i := 0; i < int(held); i++ {
 		item := w.batch[first+i]
 		w.batch[first+i] = taskItem[T]{}
-		return item
-	})
+		q.pushItem(item, shard)
+	}
 	atomic.StoreUint64(&w.state, observed&^workerHeldMask|uint64(batchRescued))
 	return int(held)
+}
+
+// shardIndex returns the ingress shard of value, or 0 when unkeyed. It is the
+// only place the queue runs key, and it runs before a submission registers
+// as a producer or reserves pending room: a key that panics then leaves the
+// queue as it was, with nothing to roll back. The shard goes to pushItem with the
+// task; it is not kept in the item.
+func (q *taskQueue[T]) shardIndex(value T) uint32 {
+	if q.shards <= 1 {
+		return 0
+	}
+	return q.keyFn(value) % uint32(q.shards)
+}
+
+// shardIndexes runs shardIndex over values ahead of a batch's admission, into
+// buf when it fits. The queue is keyed.
+func (q *taskQueue[T]) shardIndexes(values []T, buf *[shardBatch]uint32) []uint32 {
+	shards := buf[:0]
+	if len(values) > len(buf) {
+		shards = make([]uint32, 0, len(values))
+	}
+	for _, value := range values {
+		shards = append(shards, q.shardIndex(value))
+	}
+	return shards
+}
+
+// pushItem lands one task on the shard's FIFO (the single FIFO when unkeyed),
+// the shard from shardIndex before the task was admitted. The shard is not
+// kept in the item: a worker's batch is popped from one shard, the worker's
+// own at the time, and a rescued batch goes back there (see
+// rescueBatchLocked).
+func (q *taskQueue[T]) pushItem(item taskItem[T], shard uint32) {
+	if q.shards > 1 {
+		q.rings[shard].push(item)
+		return
+	}
+	q.queue.push(item)
+}
+
+// readyAny reports whether any ingress queue holds a task.
+func (q *taskQueue[T]) readyAny() bool {
+	if q.shards <= 1 {
+		return q.queue.ready()
+	}
+	for i := range q.rings {
+		if q.rings[i].ready() {
+			return true
+		}
+	}
+	return false
+}
+
+// lenAny totals the tasks waiting across the ingress queues.
+func (q *taskQueue[T]) lenAny() int {
+	if q.shards <= 1 {
+		return q.queue.len()
+	}
+	n := 0
+	for i := range q.rings {
+		n += q.rings[i].len()
+	}
+	return n
+}
+
+// enqueuedAny totals the tasks ever enqueued across the ingress queues.
+func (q *taskQueue[T]) enqueuedAny() uint64 {
+	if q.shards <= 1 {
+		return q.queue.enqueued()
+	}
+	var n uint64
+	for i := range q.rings {
+		n += q.rings[i].enqueued()
+	}
+	return n
+}
+
+// shrinkAll retires spare capacity in every ingress queue.
+func (q *taskQueue[T]) shrinkAll() {
+	if q.shards <= 1 {
+		q.queue.shrink(ringKeep)
+		return
+	}
+	for i := range q.rings {
+		q.rings[i].shrink(ringKeep)
+	}
+}
+
+// tailSmallEnough reports whether every ingress queue is already down to the
+// kept size, the shrink fast path.
+func (q *taskQueue[T]) tailSmallEnough() bool {
+	if q.shards <= 1 {
+		return len(q.queue.tailRing().vals) <= ringKeep
+	}
+	for i := range q.rings {
+		if len(q.rings[i].tailRing().vals) > ringKeep {
+			return false
+		}
+	}
+	return true
+}
+
+// monoNow reads the monotonic clock in nanoseconds.
+func monoNow() int64 { return int64(time.Since(monoEpoch)) }
+
+// tryWatch runs watchShards unless one is running or the last one was less
+// than a monitor tick ago. The monitor calls it every tick and workers every
+// watchEvery batch attempts.
+func (q *taskQueue[T]) tryWatch(now int64) {
+	if now < atomic.LoadInt64(&q.watchNext) || !atomic.CompareAndSwapUint32(&q.watching, 0, 1) {
+		return
+	}
+	if now >= atomic.LoadInt64(&q.watchNext) {
+		atomic.StoreInt64(&q.watchNext, now+int64(monitorTick))
+		atomic.AddUint32(&q.ticks, 1)
+		q.watchShards()
+	}
+	atomic.StoreUint32(&q.watching, 0)
+}
+
+// watchShards marks a keyed shard orphaned once it has held tasks for
+// orphanStaleWatches watches in which no worker took one, and unmarks a
+// marked shard a worker has served since. This hands over the shards left
+// waiting when there are more shards than running workers and none of theirs
+// runs dry; the shard of a worker blocked in a task the monitor hands over
+// sooner (see orphanStuckShardLocked). The caller holds watching.
+func (q *taskQueue[T]) watchShards() {
+	heads, stale := q.heads, q.stale
+	for i := range q.rings {
+		r := &q.rings[i]
+		if head := r.dequeued(); head != heads[i] || !r.ready() {
+			heads[i] = head
+			stale[i] = 0
+			q.unmarkOrphan(i)
+			continue
+		}
+		if stale[i]++; stale[i] >= orphanStaleWatches {
+			stale[i] = 0
+			q.markOrphan(i)
+		}
+	}
+}
+
+// markOrphan marks shard r orphaned unless it is already.
+func (q *taskQueue[T]) markOrphan(r int) {
+	if bit := uint64(1) << (r % 64); atomic.OrUint64(&q.orphaned[r/64], bit)&bit == 0 {
+		atomic.AddInt32(&q.orphans, 1)
+	}
+}
+
+// unmarkOrphan clears shard r's mark and reports whether it was the one to.
+func (q *taskQueue[T]) unmarkOrphan(r int) bool {
+	word, bit := r/64, uint64(1)<<(r%64)
+	if atomic.LoadUint64(&q.orphaned[word])&bit == 0 ||
+		atomic.AndUint64(&q.orphaned[word], ^bit)&bit == 0 {
+		return false
+	}
+	atomic.AddInt32(&q.orphans, -1)
+	return true
+}
+
+// claimOrphan makes an orphaned shard the worker's own, so it serves the
+// tasks no worker took there next. A worker claims at most one shard per
+// monitor tick: one that just moved serves its new shard for a while rather
+// than hopping on to the next orphan at once. The shard it leaves is marked
+// in turn once it has waited as long, so when no shard runs dry the workers
+// rotate over all of them, and the wait before a mark ages the shards like a
+// queue: marking a shard the moment its worker left let the same few be
+// claimed again and again while others waited, which with six shards per
+// worker stretched the longest wait of a key from 7ms to 37ms. Each worker
+// looks from its own point of a rotating start, so claims spread over the
+// marked shards and no shard is passed over for its index.
+func (q *taskQueue[T]) claimOrphan(w *worker[T]) {
+	tick := atomic.LoadUint32(&q.ticks)
+	if tick == w.claimTick {
+		return
+	}
+	shards := uint32(q.shards)
+	start := (w.seed + tick) % shards
+	for i := uint32(0); i < shards; i++ {
+		r := (start + i) % shards
+		if !q.unmarkOrphan(int(r)) {
+			continue
+		}
+		atomic.StoreInt32(&w.ring, int32(r))
+		w.claimTick = tick
+		return
+	}
+}
+
+// watchStuckShardLocked hands over the shard of a worker that has been in one
+// task for batchRescueTicks ticks or more whenever the shard holds tasks that
+// no worker took since the last tick: they wait behind the blocked task, and
+// the held batch rescue reaches only the ones the worker took itself. Tasks
+// can arrive there at any point while the worker stays blocked, so the shard
+// is watched on every tick it does, and not just the one it got stuck on. A
+// shard another worker took over keeps being served and is left alone:
+// marking it again would pull yet another worker off its own shard each tick.
+// It runs from the tick a worker counts as stuck, so the dequeue count it
+// compares against is a tick old by the first tick it may hand over. The
+// caller holds mu.
+func (q *taskQueue[T]) watchStuckShardLocked(w *worker[T]) {
+	r := int(atomic.LoadInt32(&w.ring))
+	head := q.rings[r].dequeued()
+	if w.stuckTicks >= batchRescueTicks && head == w.stuckHead && q.rings[r].ready() {
+		q.markOrphan(r)
+	}
+	w.stuckHead = head
+}
+
+// clearOrphans drops every mark, once the monitor stops: whatever it marked
+// has drained by then.
+func (q *taskQueue[T]) clearOrphans() {
+	for word := range q.orphaned {
+		if old := atomic.SwapUint64(&q.orphaned[word], 0); old != 0 {
+			atomic.AddInt32(&q.orphans, -int32(bits.OnesCount64(old)))
+		}
+	}
+}
+
+func (q *taskQueue[T]) observeWorkersLocked() (stuck, progress, held int64) {
+	for _, w := range q.workers {
+		if w.parked {
+			w.stuckTicks = 0
+			continue
+		}
+		state := atomic.LoadUint64(&w.state)
+		if seq := uint32(state >> 32); seq != w.lastSeq {
+			progress += int64(seq - w.lastSeq)
+			w.lastSeq = seq
+			w.stuckTicks = 0
+		} else if w.stuckTicks++; w.stuckTicks >= stuckTicks {
+			stuck++
+			if w.stuckTicks >= batchRescueTicks && q.opt.maxBatchSize > 1 &&
+				q.opt.concurrency > 1 && int32(state) > 0 {
+				q.rescueBatchLocked(w, state)
+				state = atomic.LoadUint64(&w.state)
+			}
+			if q.shards > 1 {
+				q.watchStuckShardLocked(w)
+			}
+		}
+		if remaining := int32(state); remaining > 0 {
+			held += int64(remaining)
+		}
+	}
+	return stuck, progress, held
+}
+
+// popWorkerBatch takes the next batch. A keyed worker takes it from its own
+// shard while that holds tasks, and otherwise from the first shard of a scan
+// that holds any, which then becomes its own: shards follow the load to the
+// workers without a hint on the wake. A shard the monitor found unattended
+// is claimed first (see claimOrphan). Only workers whose shard it is take
+// from a shard, so a shard's dequeues tell the monitor whether one serves it.
+func (q *taskQueue[T]) popWorkerBatch(w *worker[T], dst []taskItem[T]) (int, bool) {
+	if q.shards <= 1 {
+		return q.queue.popBatch(dst)
+	}
+	if w.pops++; w.pops%watchEvery == 0 {
+		q.tryWatch(monoNow())
+	}
+	if atomic.LoadInt32(&q.orphans) > 0 {
+		q.claimOrphan(w)
+	}
+	if k, contended := q.rings[atomic.LoadInt32(&w.ring)].popBatch(dst); k > 0 {
+		return k, contended
+	}
+	return q.scanBatch(w, dst)
+}
+
+// scanBatch takes a batch from the first shard holding tasks and makes that
+// shard the worker's own. Successive scans of a worker start at successive
+// shards, from an offset that differs per worker, so scanning workers spread
+// over the shards.
+func (q *taskQueue[T]) scanBatch(w *worker[T], dst []taskItem[T]) (int, bool) {
+	shards := uint32(q.shards)
+	w.scans++
+	start := (w.seed + w.scans) % shards
+	for i := uint32(0); i < shards; i++ {
+		r := int((start + i) % shards)
+		if k, contended := q.rings[r].popBatch(dst); k > 0 {
+			atomic.StoreInt32(&w.ring, int32(r))
+			return k, contended
+		}
+	}
+	return 0, false
 }
 
 func (q *taskQueue[T]) exec(value T) {
@@ -681,7 +1149,7 @@ const (
 func (q *taskQueue[T]) idleWorker(w *worker[T]) int {
 	q.mu.Lock()
 	atomic.AddInt64(&q.running, -1)
-	if q.queue.ready() && atomic.LoadInt64(&q.running) < atomic.LoadInt64(&q.target) {
+	if q.readyAny() && atomic.LoadInt64(&q.running) < atomic.LoadInt64(&q.target) {
 		atomic.AddInt64(&q.running, 1)
 		q.mu.Unlock()
 		return idleResume
@@ -748,7 +1216,7 @@ func (q *taskQueue[T]) recycle(w *worker[T]) {
 	q.live--
 	q.removeLocked(w)
 	q.mu.Unlock()
-	if q.queue.ready() {
+	if q.readyAny() {
 		q.dispatch(1)
 	}
 }
@@ -836,40 +1304,22 @@ func (q *taskQueue[T]) startMonitor() {
 func (q *taskQueue[T]) monitor() {
 	var probe loadProbe
 	quiet, idleTicks, behind := 0, 0, 0
-	lastTail, lastBacklog := q.queue.enqueued(), int64(q.queue.len())
+	lastTail, lastBacklog := q.enqueuedAny(), int64(q.lenAny())
 	for {
 		start := time.Now()
 		time.Sleep(monitorTick)
 		lateness := time.Since(start) - monitorTick
-
-		stuck, progress, held := int64(0), int64(0), int64(0)
-		q.mu.Lock()
-		for _, w := range q.workers {
-			if w.parked {
-				w.stuckTicks = 0
-				continue
-			}
-			state := atomic.LoadUint64(&w.state)
-			if seq := uint32(state >> 32); seq != w.lastSeq {
-				progress += int64(seq - w.lastSeq)
-				w.lastSeq = seq
-				w.stuckTicks = 0
-			} else if w.stuckTicks++; w.stuckTicks >= stuckTicks {
-				stuck++
-				if w.stuckTicks >= batchRescueTicks && q.opt.maxBatchSize > 1 &&
-					q.opt.concurrency > 1 && int32(state) > 0 {
-					q.rescueBatchLocked(w, state)
-					state = atomic.LoadUint64(&w.state)
-				}
-			}
-			if remaining := int32(state); remaining > 0 {
-				held += int64(remaining)
-			}
+		if q.shards > 1 {
+			atomic.AddUint32(&q.monTicks, 1)
+			q.tryWatch(monoNow())
 		}
+
+		q.mu.Lock()
+		stuck, progress, held := q.observeWorkersLocked()
 		base := q.base
 		stopped := q.stopped
 		q.mu.Unlock()
-		queued := int64(q.queue.len())
+		queued := int64(q.lenAny())
 		backlog := queued + held
 
 		extra := q.extra
@@ -884,7 +1334,7 @@ func (q *taskQueue[T]) monitor() {
 		} else {
 			idleTicks = 0
 		}
-		tail := q.queue.enqueued()
+		tail := q.enqueuedAny()
 		arrivals := int64(tail - lastTail)
 		falling := backlog > lastBacklog && arrivals > 2*progress
 		lastTail, lastBacklog = tail, backlog
@@ -947,7 +1397,10 @@ func (q *taskQueue[T]) monitor() {
 		q.extra = 0
 		atomic.StoreInt64(&q.target, base)
 		atomic.StoreUint32(&q.throttle, 0)
-		q.queue.shrink(ringKeep)
+		q.shrinkAll()
+		if q.shards > 1 {
+			q.clearOrphans()
+		}
 		q.finishMonitor()
 		return
 	}

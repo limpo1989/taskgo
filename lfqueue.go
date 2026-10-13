@@ -335,6 +335,12 @@ func (q *lfQueue[T]) enqueued() uint64 {
 	return atomic.LoadUint64(&q.tailRing().tail) &^ ringClosed
 }
 
+// dequeued returns how many tickets consumers have taken. It only grows, so a
+// value that has not moved means no consumer took anything in between.
+func (q *lfQueue[T]) dequeued() uint64 {
+	return atomic.LoadUint64(&q.headRing().head)
+}
+
 // len returns the number of claimed tickets not yet dequeued. It is a snapshot
 // and may be stale by the time it returns.
 func (q *lfQueue[T]) len() int {
