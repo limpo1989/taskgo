@@ -103,15 +103,22 @@ type taskItem[T any] struct {
 // a second, so a shard without a worker waited over 100ms to be handed over.
 const watchEvery = 64
 
-// orphanStaleWatches is how many watches, about a millisecond apart, a keyed
-// shard may hold tasks without any worker taking one before it is handed
-// over. Shards go unattended for a while all the time: a worker serves its
-// own shard until it runs dry and only then takes over another, so in a burst
-// over more shards than workers the others wait their turn. That wait is what
-// keeps a key's tasks on one CPU, and the threshold sits above it: on a
-// saturated echo server with 48 shards and 24 workers, handing shards over
-// after 5 watches cost 6% of its throughput, after 50 nothing measurable.
-const orphanStaleWatches = 50
+// orphanStale is how long a keyed shard may hold tasks without any worker
+// taking one before it is handed over. Shards go unattended for a while all
+// the time: a worker serves its own shard until it runs dry and only then
+// takes over another, so in a burst over more shards than workers the others
+// wait their turn. That wait is what keeps a key's tasks on one CPU, and the
+// threshold sits above it: on a saturated echo server with 48 shards and 24
+// workers, handing shards over after 5ms cost 6% of its throughput, after
+// 50ms nothing measurable.
+const orphanStale = 50 * time.Millisecond
+
+// watchCredit is the longest time since the last watch that a watch adds to a
+// shard's wait. A longer gap is a pause in the watching, with the queue idle
+// and its monitor gone, and counts as one monitorTick, as a watch did before
+// waits were timed. It sits above the 15.6ms steps of the Windows clock,
+// which pace the watches there no closer than one step apart.
+const watchCredit = 20 * time.Millisecond
 
 // shardBatch is the stack room shardIndexes has for a batch before it
 // allocates.
@@ -241,12 +248,13 @@ type taskQueue[T any] struct {
 	queue lfQueue[taskItem[T]] // the ingress when shards <= 1
 	// Keyed ingress (see NewTaskKeyed): one FIFO per shard, plus the fields
 	// that watch for shards left without a worker.
-	rings    []lfQueue[taskItem[T]]
-	orphaned []uint64 // atomic bits: unattended shards
-	heads    []uint64 // guarded by watching: dequeues at the last watch
-	stale    []uint8  // guarded by watching: watches without progress
-	shards   int
-	keyFn    func(T) uint32
+	rings     []lfQueue[taskItem[T]]
+	orphaned  []uint64 // atomic bits: unattended shards
+	heads     []uint64 // guarded by watching: dequeues at the last watch
+	waited    []int64  // guarded by watching: nanoseconds held without progress
+	lastWatch int64    // guarded by watching: monoNow at the last watch
+	shards    int
+	keyFn     func(T) uint32
 
 	mu             sync.Mutex
 	live           int          // live workers, at most opt.concurrency
@@ -334,7 +342,7 @@ func (q *taskQueue[T]) initQueues(hint int) {
 		}
 		q.orphaned = make([]uint64, (q.shards+63)/64)
 		q.heads = make([]uint64, q.shards)
-		q.stale = make([]uint8, q.shards)
+		q.waited = make([]int64, q.shards)
 		return
 	}
 	q.queue.init(hint)
@@ -950,29 +958,36 @@ func (q *taskQueue[T]) tryWatch(now int64) {
 	if now >= atomic.LoadInt64(&q.watchNext) {
 		atomic.StoreInt64(&q.watchNext, now+int64(monitorTick))
 		atomic.AddUint32(&q.ticks, 1)
-		q.watchShards()
+		q.watchShards(now)
 	}
 	atomic.StoreUint32(&q.watching, 0)
 }
 
 // watchShards marks a keyed shard orphaned once it has held tasks for
-// orphanStaleWatches watches in which no worker took one, and unmarks a
-// marked shard a worker has served since. This hands over the shards left
-// waiting when there are more shards than running workers and none of theirs
-// runs dry; the shard of a worker blocked in a task the monitor hands over
-// sooner (see orphanStuckShardLocked). The caller holds watching.
-func (q *taskQueue[T]) watchShards() {
-	heads, stale := q.heads, q.stale
+// orphanStale in which no worker took one, and unmarks a marked shard a
+// worker has served since. The wait is measured on the clock rather than in
+// watches, whose pace the clock's resolution and the monitor's lateness set.
+// This hands over the shards left waiting when there are more shards than
+// running workers and none of theirs runs dry; the shard of a worker blocked
+// in a task the monitor hands over sooner (see orphanStuckShardLocked). The
+// caller holds watching.
+func (q *taskQueue[T]) watchShards(now int64) {
+	step := now - q.lastWatch
+	if step > int64(watchCredit) {
+		step = int64(monitorTick)
+	}
+	q.lastWatch = now
+	heads, waited := q.heads, q.waited
 	for i := range q.rings {
 		r := &q.rings[i]
 		if head := r.dequeued(); head != heads[i] || !r.ready() {
 			heads[i] = head
-			stale[i] = 0
+			waited[i] = 0
 			q.unmarkOrphan(i)
 			continue
 		}
-		if stale[i]++; stale[i] >= orphanStaleWatches {
-			stale[i] = 0
+		if waited[i] += step; waited[i] >= int64(orphanStale) {
+			waited[i] = 0
 			q.markOrphan(i)
 		}
 	}

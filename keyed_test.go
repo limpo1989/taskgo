@@ -87,7 +87,7 @@ func TestTaskKeyedFloodDrains(t *testing.T) {
 
 // A shard that never runs dry - here a key whose task resubmits itself - must
 // not keep the only worker from the other shards: the other shard is handed
-// to it once its task has waited orphanStaleWatches watches. Without the
+// to it once its task has waited orphanStale. Without the
 // handover the task on the other shard never runs.
 func TestTaskKeyedHotShardDoesNotStarveOthers(t *testing.T) {
 	var q *Task[uint32]
@@ -325,7 +325,7 @@ func saturatingShards(t *testing.T) (shards, workers int) {
 }
 
 // With more shards than workers and no shard ever running dry, the shards
-// left waiting are handed over after orphanStaleWatches watches, so the
+// left waiting are handed over after orphanStale, so the
 // workers rotate over all of them and no key waits much longer than that.
 // Without the handover the shards beyond the workers' own are never served.
 func TestTaskKeyedShardsOutnumberingWorkersAreAllServed(t *testing.T) {
@@ -364,10 +364,10 @@ func TestTaskKeyedBlockedTaskDoesNotStallItsShard(t *testing.T) {
 // leaves the monitor no worker to add. The monitor hands the stuck worker's
 // shard over at the point it rescues a held batch, so the tasks queued behind
 // the blocked one run on the busy worker within a few ticks, long before the
-// shard would count as unattended (orphanStaleWatches).
+// shard would count as unattended (orphanStale).
 func TestTaskKeyedBlockedAndHotShardsLeaveNoTaskBehind(t *testing.T) {
 	// The monitor needs a P beside the hot worker to tick on time; with one P
-	// the shard waits for the hot worker's own watches (orphanStaleWatches).
+	// the shard waits for the hot worker's own watches (orphanStale).
 	if procs := runtime.GOMAXPROCS(0); procs < 2 {
 		t.Skipf("needs GOMAXPROCS >= 2, have %d", procs)
 	}
@@ -408,7 +408,7 @@ func TestTaskKeyedBlockedAndHotShardsLeaveNoTaskBehind(t *testing.T) {
 	// worker-assisted watches advance q.ticks too, so it runs ahead whenever
 	// the monitor is scheduled late, and the stuck worker's shard is handed
 	// over a few monitor ticks after the tasks arrive, where the fallback for
-	// an unattended shard needs orphanStaleWatches of them.
+	// an unattended shard needs orphanStale of them.
 	start := atomic.LoadUint32(&q.monTicks)
 	for {
 		select {
@@ -459,8 +459,9 @@ func TestTaskKeyedWatchesKeepPaceWhenWorkersHoldEveryP(t *testing.T) {
 	const window = 500 * time.Millisecond
 	before := atomic.LoadUint32(&q.ticks)
 	time.Sleep(window)
-	// A watch is due every monitorTick; a third of that pace is plenty here.
-	if got, want := atomic.LoadUint32(&q.ticks)-before, uint32(window/monitorTick/3); got < want {
+	// A watch is due every monitorTick, or every step of a coarser clock; a
+	// shard's wait is counted in full as long as one comes every watchCredit.
+	if got, want := atomic.LoadUint32(&q.ticks)-before, uint32(window/watchCredit); got < want {
 		t.Fatalf("%d watches in %v with %d workers on %d Ps, want at least %d", got, window, procs, procs, want)
 	}
 }
@@ -585,7 +586,7 @@ func TestTaskKeyedStuckWorkerShardHandover(t *testing.T) {
 }
 
 // Tasks that reach a blocked worker's shard well after it got stuck are handed
-// over at the monitor's next tick, not after orphanStaleWatches.
+// over at the monitor's next tick, not after orphanStale.
 func TestTaskKeyedLateTaskBehindBlockedTaskIsHandedOver(t *testing.T) {
 	if procs := runtime.GOMAXPROCS(0); procs < 2 {
 		t.Skipf("needs GOMAXPROCS >= 2 for the monitor to tick beside the hot worker, have %d", procs)
