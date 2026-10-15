@@ -673,3 +673,130 @@ func TestTaskKeyedNoKeyAfterStop(t *testing.T) {
 		t.Fatalf("key ran %d times after Stop", got)
 	}
 }
+
+// occupiedBits returns the shards whose occupied bit is set.
+func (q *taskQueue[T]) occupiedBits() []int {
+	var set []int
+	for r := range q.shards {
+		if atomic.LoadUint64(&q.occupied[r/64])&(uint64(1)<<(r%64)) != 0 {
+			set = append(set, r)
+		}
+	}
+	return set
+}
+
+// A pop that runs a shard dry clears its bit only when the shard is still
+// empty after the clear. The task here was published while the bit was set,
+// so its producer left the bit as it was: clearing it for good would hide the
+// task from every worker that looks for work.
+func TestTaskKeyedSettleEmptyKeepsTaskArrivedMeanwhile(t *testing.T) {
+	q := NewTaskKeyed(func(uint32) {}, identityKey, 8)
+	defer q.Stop(context.Background())
+
+	q.markOccupied(3)
+	if q.settleEmpty(3) {
+		t.Fatal("settleEmpty reported a task on an empty shard")
+	}
+	if got := q.occupiedBits(); len(got) != 0 {
+		t.Fatalf("occupied = %v after an empty shard settled, want none", got)
+	}
+
+	q.markOccupied(5)
+	q.rings[5].push(taskItem[uint32]{value: 5}) // published, bit already set
+	if !q.settleEmpty(5) {
+		t.Fatal("settleEmpty missed the task that arrived after the pop")
+	}
+	if got := q.occupiedBits(); len(got) != 1 || got[0] != 5 {
+		t.Fatalf("occupied = %v, want [5]: the shard holds a task", got)
+	}
+	if !q.readyAny() {
+		t.Fatal("readyAny = false with a task queued")
+	}
+
+	if q.settleEmpty(6) {
+		t.Fatal("settleEmpty reported a task on an unmarked empty shard")
+	}
+	q.rings[5].pop() // no worker ever ran: leave Stop nothing to wait for
+}
+
+// A scan finds tasks on either side of its start, across words, and clears
+// the bit of every marked shard it finds empty on the way.
+func TestTaskKeyedScanFollowsOccupiedBits(t *testing.T) {
+	for _, shards := range []int{8, 130} {
+		q := NewTaskKeyed(func(uint32) {}, identityKey, shards)
+		w := &worker[uint32]{}
+		w.initBatch(1)
+		for _, start := range []int{0, 1, shards / 2, shards - 1} {
+			// Tasks just before and well after the start, so the scan has to
+			// wrap to reach one of them, and a stale mark in between.
+			before := (start + shards - 1) % shards
+			after := (start + shards/3) % shards
+			stale := (start + shards/4 + 1) % shards
+			q.pushItem(taskItem[uint32]{value: uint32(before)}, uint32(before))
+			q.pushItem(taskItem[uint32]{value: uint32(after)}, uint32(after))
+			q.markOccupied(stale)
+			w.seed, w.scans = uint32(start), ^uint32(0) // the next scan starts at start
+			var got []int
+			for {
+				k, _ := q.scanBatch(w, w.batch[:1])
+				if k == 0 {
+					break
+				}
+				got = append(got, int(w.batch[0].value))
+				if r := int(atomic.LoadInt32(&w.ring)); r != got[len(got)-1] {
+					t.Fatalf("shards=%d start=%d: worker ring %d after taking from %d", shards, start, r, got[len(got)-1])
+				}
+				w.seed, w.scans = uint32(start), ^uint32(0)
+			}
+			if len(got) != 2 || got[0] != after || got[1] != before {
+				t.Fatalf("shards=%d start=%d: scan took %v, want [%d %d]", shards, start, got, after, before)
+			}
+			if bits := q.occupiedBits(); len(bits) != 0 {
+				t.Fatalf("shards=%d start=%d: occupied = %v after the scan drained every shard", shards, start, bits)
+			}
+		}
+		q.Stop(context.Background())
+	}
+}
+
+// Producers that each wait for their task before submitting the next run
+// every shard dry after every task, so workers keep settling shards and
+// parking while tasks arrive: a task that lands between a worker's clear and
+// its look again, or between its last scan and its park, must still run.
+func TestTaskKeyedNoTaskLostWhileShardsRunDry(t *testing.T) {
+	const producers, rounds = 8, 20000
+	var latest atomic.Int64
+	done := make([]chan struct{}, producers)
+	for i := range done {
+		done[i] = make(chan struct{}, 1)
+	}
+	q := NewTaskKeyed(func(k uint32) { done[k%producers] <- struct{}{} },
+		identityKey, 16, WithConcurrency(3), WithMaxIdle(30*time.Second))
+	defer q.Stop(context.Background())
+	var wg sync.WaitGroup
+	for p := range producers {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for i := range rounds {
+				begin := time.Now()
+				q.Push(uint32(p + producers*(i%5)))
+				select {
+				case <-done[p]:
+				case <-time.After(2 * time.Second):
+					t.Errorf("producer %d round %d: task did not run", p, i)
+					return
+				}
+				wait := int64(time.Since(begin))
+				for seen := latest.Load(); wait > seen && !latest.CompareAndSwap(seen, wait); seen = latest.Load() {
+				}
+				if i%64 == 0 {
+					runtime.Gosched()
+				}
+			}
+		}()
+	}
+	wg.Wait()
+	waitFor(t, time.Second, func() bool { return len(q.occupiedBits()) == 0 })
+	t.Logf("longest wait %v", time.Duration(latest.Load()))
+}

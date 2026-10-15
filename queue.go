@@ -249,6 +249,7 @@ type taskQueue[T any] struct {
 	// Keyed ingress (see NewTaskKeyed): one FIFO per shard, plus the fields
 	// that watch for shards left without a worker.
 	rings     []lfQueue[taskItem[T]]
+	occupied  []uint64 // atomic bits: shards that may hold tasks; see markOccupied
 	orphaned  []uint64 // atomic bits: unattended shards
 	heads     []uint64 // guarded by watching: dequeues at the last watch
 	waited    []int64  // guarded by watching: nanoseconds held without progress
@@ -340,6 +341,10 @@ func (q *taskQueue[T]) initQueues(hint int) {
 		for i := range q.rings {
 			q.rings[i].init(per)
 		}
+		// Every push and every pop that runs a shard dry may write occupied,
+		// so it gets cache lines of its own.
+		words, pad := (q.shards+63)/64, cacheLinePad/8
+		q.occupied = make([]uint64, pad+words+pad)[pad : pad+words]
 		q.orphaned = make([]uint64, (q.shards+63)/64)
 		q.heads = make([]uint64, q.shards)
 		q.waited = make([]int64, q.shards)
@@ -878,18 +883,58 @@ func (q *taskQueue[T]) shardIndexes(values []T, buf *[shardBatch]uint32) []uint3
 func (q *taskQueue[T]) pushItem(item taskItem[T], shard uint32) {
 	if q.shards > 1 {
 		q.rings[shard].push(item)
+		q.markOccupied(int(shard))
 		return
 	}
 	q.queue.push(item)
 }
 
-// readyAny reports whether any ingress queue holds a task.
+// markOccupied sets shard r's bit in occupied after a task was published
+// there. The bit only has to be set once the task is visible: a pop that ran
+// the shard dry clears it and then looks at the shard again (see
+// settleEmpty), so either that look finds the task or this call comes after
+// the clear and sets the bit again. A bit that is set already is only read,
+// so while shards stay busy their producers share the line instead of
+// writing it.
+func (q *taskQueue[T]) markOccupied(r int) {
+	word, bit := &q.occupied[r/64], uint64(1)<<(r%64)
+	if atomic.LoadUint64(word)&bit == 0 {
+		atomic.OrUint64(word, bit)
+	}
+}
+
+// settleEmpty clears shard r's bit after a pop found the shard empty, and
+// reports whether a task arrived there meanwhile, in which case the bit is set
+// again. A bit may stay set over an empty shard, when the task that set it was
+// taken by a worker that did not run the shard dry; the next pop that finds
+// the shard empty clears it. A bit is never clear over a task for longer than
+// a settleEmpty in progress, which looks at the shard again before returning.
+func (q *taskQueue[T]) settleEmpty(r int) bool {
+	word, bit := &q.occupied[r/64], uint64(1)<<(r%64)
+	if atomic.LoadUint64(word)&bit == 0 {
+		return false
+	}
+	atomic.AndUint64(word, ^bit)
+	if !q.rings[r].ready() {
+		return false
+	}
+	atomic.OrUint64(word, bit)
+	return true
+}
+
+// readyAny reports whether any ingress queue may hold a task. A keyed queue
+// answers from occupied, which can report a shard whose tasks were all taken
+// since: a worker that resumes for it finds it empty and clears its bit. It
+// misses a task only while the task's producer has yet to mark it, and that
+// producer checks the running workers after marking, so it sees the slot an
+// idle worker released before asking; or while a settleEmpty is between its
+// clear and its second look, whose running worker takes the task.
 func (q *taskQueue[T]) readyAny() bool {
 	if q.shards <= 1 {
 		return q.queue.ready()
 	}
-	for i := range q.rings {
-		if q.rings[i].ready() {
+	for i := range q.occupied {
+		if atomic.LoadUint64(&q.occupied[i]) != 0 {
 			return true
 		}
 	}
@@ -1115,25 +1160,50 @@ func (q *taskQueue[T]) popWorkerBatch(w *worker[T], dst []taskItem[T]) (int, boo
 	if atomic.LoadInt32(&q.orphans) > 0 {
 		q.claimOrphan(w)
 	}
-	if k, contended := q.rings[atomic.LoadInt32(&w.ring)].popBatch(dst); k > 0 {
+	own := int(atomic.LoadInt32(&w.ring))
+	if k, contended := q.rings[own].popBatch(dst); k > 0 {
 		return k, contended
+	}
+	if q.settleEmpty(own) {
+		if k, contended := q.rings[own].popBatch(dst); k > 0 {
+			return k, contended
+		}
 	}
 	return q.scanBatch(w, dst)
 }
 
 // scanBatch takes a batch from the first shard holding tasks and makes that
-// shard the worker's own. Successive scans of a worker start at successive
-// shards, from an offset that differs per worker, so scanning workers spread
-// over the shards.
+// shard the worker's own. It looks only at the shards marked in occupied, and
+// settles a marked shard it finds empty, so a worker that finds no work reads
+// a word per 64 shards rather than every shard's queue. Successive scans of a
+// worker start at successive shards, from an offset that differs per worker,
+// so scanning workers spread over the shards.
 func (q *taskQueue[T]) scanBatch(w *worker[T], dst []taskItem[T]) (int, bool) {
-	shards := uint32(q.shards)
 	w.scans++
-	start := (w.seed + w.scans) % shards
-	for i := uint32(0); i < shards; i++ {
-		r := int((start + i) % shards)
-		if k, contended := q.rings[r].popBatch(dst); k > 0 {
-			atomic.StoreInt32(&w.ring, int32(r))
-			return k, contended
+	start := int((w.seed + w.scans) % uint32(q.shards))
+	words := len(q.occupied)
+	first, below := start/64, uint64(1)<<(start%64)-1
+	// The word holding start is visited twice, its bits from start on first
+	// and the ones below start last, so the scan wraps around once.
+	for i := 0; i <= words; i++ {
+		word := (first + i) % words
+		marks := atomic.LoadUint64(&q.occupied[word])
+		switch i {
+		case 0:
+			marks &^= below
+		case words:
+			marks &= below
+		}
+		for ; marks != 0; marks &= marks - 1 {
+			r := word*64 + bits.TrailingZeros64(marks)
+			k, contended := q.rings[r].popBatch(dst)
+			if k == 0 && q.settleEmpty(r) {
+				k, contended = q.rings[r].popBatch(dst)
+			}
+			if k > 0 {
+				atomic.StoreInt32(&w.ring, int32(r))
+				return k, contended
+			}
 		}
 	}
 	return 0, false
