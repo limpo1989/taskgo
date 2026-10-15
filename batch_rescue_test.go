@@ -7,6 +7,8 @@ import (
 	"sync/atomic"
 	"testing"
 	"time"
+
+	"github.com/petermattis/goid"
 )
 
 // Start at a full batch so the tests exercise a blocked batch independently
@@ -18,7 +20,10 @@ func startBatchWorkerForTest[T any](q *taskQueue[T]) {
 	q.workers = append(q.workers, w)
 	q.live++
 	atomic.AddInt64(&q.running, 1)
-	go q.runWorker(w, q.opt.maxBatchSize)
+	go func() {
+		atomic.StoreInt64(&w.goid, goid.Get()) // as worker does
+		q.runWorker(w, q.opt.maxBatchSize)
+	}()
 	q.mu.Unlock()
 }
 

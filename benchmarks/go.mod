@@ -7,7 +7,10 @@ require (
 	github.com/lxzan/concurrency v1.4.3
 )
 
-require github.com/lxzan/dao v1.1.12 // indirect
+require (
+	github.com/lxzan/dao v1.1.12 // indirect
+	github.com/petermattis/goid v0.0.0-20260918085751-abfca077860b // indirect
+)
 
 // Use the in-tree library rather than a published version, so the benchmarks
 // always run against the local source.

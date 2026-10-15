@@ -27,11 +27,14 @@ package taskgo
 
 import (
 	"context"
+	"errors"
 	"math/bits"
 	"runtime"
 	"sync"
 	"sync/atomic"
 	"time"
+
+	"github.com/petermattis/goid"
 )
 
 // Job is a unit of work with no arguments and no return value.
@@ -185,7 +188,8 @@ type worker[T any] struct {
 
 	// Guarded by taskQueue.mu.
 	lastUsed   time.Time
-	parked     bool
+	parked     bool   // on its channel: in idle, or dismissed and not yet retired
+	goid       int64  // atomic: the worker goroutine's id, for Stop to recognize its caller
 	index      int    // position in taskQueue.workers
 	lastSeq    uint32 // seq seen at the monitor's previous tick
 	stuckTicks int
@@ -258,13 +262,21 @@ type taskQueue[T any] struct {
 	keyFn     func(T) uint32
 
 	mu             sync.Mutex
-	live           int          // live workers, at most opt.concurrency
+	live           int          // live workers, at most opt.concurrency; counted until they exit
 	spawned        uint32       // workers ever started, seeding keyed scans
 	idle           []*worker[T] // parked workers, most recently parked last
 	workers        []*worker[T] // every live worker, scanned by the monitor
 	stopped        bool
 	janitorRunning bool
 	pool           sync.Pool
+
+	// stopping is closed once the first Stop has refused new submissions and
+	// dismissed the parked workers; every Stop waits for it before it waits
+	// for the queue to drain, and the janitor exits on it. selfStops counts
+	// the Stop calls waiting from inside a task of this queue, whose own
+	// workers the drain cannot wait for.
+	stopping  chan struct{}
+	selfStops int64 // atomic
 
 	extra int64 // owned by the monitor: running slots added for blocked workers
 
@@ -282,7 +294,7 @@ func newTaskQueue[T any](opts []Option, run func(T)) *taskQueue[T] {
 // FIFOs by key, or a single FIFO when shards <= 1.
 func newShardedTaskQueue[T any](opts []Option, run func(T), key func(T) uint32, shards int) *taskQueue[T] {
 	o := newOptions(opts)
-	q := &taskQueue[T]{opt: o, run: run, keyFn: key, shards: shards}
+	q := &taskQueue[T]{opt: o, run: run, keyFn: key, shards: shards, stopping: make(chan struct{})}
 	base := int64(autoWorkerLimit(o.concurrency))
 	q.base = base
 	q.target = base
@@ -366,24 +378,81 @@ func (q *taskQueue[T]) Len() int {
 	return n
 }
 
+// ErrStopInTask is returned by a Stop called from a task when tasks remain
+// that no worker can run before that task returns: every worker the
+// concurrency limit allows is a task waiting in Stop. Those tasks still run,
+// once the tasks that called Stop have returned.
+var ErrStopInTask = errors.New("taskgo: Stop called from a task cannot wait for the tasks queued behind it")
+
 // Stop shuts the queue down and waits for outstanding tasks to finish.
 //
 // After Stop is called, further Push calls are dropped. Queued and in-flight
 // tasks still run to completion, until they all finish or the deadline implied
 // by ctx and WithTimeout is reached. Stop returns nil on a clean drain, or the
 // context error on timeout or cancellation.
+//
+// Every call waits, the ones made while another is still waiting and the ones
+// made after a call that timed out included, and returns nil only once the
+// queue has drained. A task, or the panic handler, may call Stop: it waits for
+// every other task, the ones queued behind the calling task included, but not
+// for the task it is called from, which is still running when it returns; it
+// returns ErrStopInTask if those tasks can run only after it has returned.
 func (q *taskQueue[T]) Stop(ctx context.Context) error {
-	q.mu.Lock()
-	if q.stopped {
-		q.mu.Unlock()
-		return nil
-	}
-	q.stopped = true
-	q.mu.Unlock()
+	ctx, cancel := context.WithTimeout(ctx, q.opt.timeout)
+	defer cancel()
 
-	// Refuse new submissions, then wait for the submitters already past the
-	// stop check. Once they have dispatched, every accepted task has a
-	// running worker that will reach it.
+	q.mu.Lock()
+	first := !q.stopped
+	q.stopped = true
+	self := q.callerWorkerLocked()
+	q.mu.Unlock()
+	if self != nil {
+		atomic.AddInt64(&q.selfStops, 1)
+		defer atomic.AddInt64(&q.selfStops, -1)
+	}
+
+	if first {
+		q.beginStop()
+	} else {
+		select {
+		case <-q.stopping:
+		case <-ctx.Done():
+			return ctx.Err()
+		}
+	}
+	if self != nil {
+		// The calling task's worker runs the rest of its batch only once the
+		// task returns: hand that rest to the other workers.
+		q.handOffHeld(self)
+	}
+
+	ticker := time.NewTicker(stopCheckInterval)
+	defer ticker.Stop()
+	for {
+		if q.finished() {
+			return nil
+		}
+		if self != nil && atomic.LoadInt64(&q.selfStops) >= int64(q.opt.concurrency) {
+			// Every worker the limit allows is a task waiting here: what is
+			// left runs only once those tasks return.
+			return ErrStopInTask
+		}
+		select {
+		case <-ticker.C:
+		case <-ctx.Done():
+			if q.finished() {
+				return nil
+			}
+			return ctx.Err()
+		}
+	}
+}
+
+// beginStop is the first Stop's part: it refuses new submissions, waits for
+// the submitters already past the stop check, dismisses the parked workers
+// and then closes stopping. Once the submitters have dispatched, every
+// accepted task has a running worker that will reach it.
+func (q *taskQueue[T]) beginStop() {
 	for {
 		v := atomic.LoadInt64(&q.producers)
 		if atomic.CompareAndSwapInt64(&q.producers, v, v|producerStopped) {
@@ -394,41 +463,50 @@ func (q *taskQueue[T]) Stop(ctx context.Context) error {
 		runtime.Gosched()
 	}
 
-	// Dismiss every parked worker; each is blocked on <-w.ch.
+	// Dismiss every parked worker; each is blocked on <-w.ch. They stay
+	// parked and live until they have retired (see retire).
 	q.mu.Lock()
 	idle := q.idle
 	q.idle = nil
-	for _, w := range idle {
-		w.parked = false
-	}
-	q.live -= len(idle)
 	q.mu.Unlock()
 	for _, w := range idle {
 		w.ch <- true
 	}
+	close(q.stopping)
+}
 
-	ctx2, cancel := context.WithTimeout(ctx, q.opt.timeout)
-	defer cancel()
-	ticker := time.NewTicker(stopCheckInterval)
-	defer ticker.Stop()
+// callerWorkerLocked returns the worker whose task is calling, or nil when
+// the caller is not one of this queue's workers. The caller holds mu.
+func (q *taskQueue[T]) callerWorkerLocked() *worker[T] {
+	me := goid.Get()
+	for _, w := range q.workers {
+		if atomic.LoadInt64(&w.goid) == me && !w.parked {
+			return w
+		}
+	}
+	return nil
+}
 
-	for {
-		if q.finished() {
-			return nil
-		}
-		select {
-		case <-ticker.C:
-		case <-ctx2.Done():
-			if q.finished() {
-				return nil
-			}
-			return ctx2.Err()
-		}
+// handOffHeld returns the unstarted tail of the batch the calling task
+// came from to the ingress queue, and makes sure workers come for it, as the
+// monitor's rescue of a stalled batch does: the worker would reach those
+// tasks only after the task that is waiting for them.
+func (q *taskQueue[T]) handOffHeld(w *worker[T]) {
+	q.mu.Lock()
+	n := 0
+	if state := atomic.LoadUint64(&w.state); int32(state) > 0 {
+		n = q.claimBatchLocked(w, state)
+	}
+	q.mu.Unlock()
+	if n > 0 {
+		q.dispatch(n)
 	}
 }
 
 func (q *taskQueue[T]) finished() bool {
-	return q.lenAny() == 0 && atomic.LoadInt64(&q.running) == 0
+	// The workers whose tasks wait in Stop are running, and stay running
+	// until Stop returns.
+	return q.lenAny() == 0 && atomic.LoadInt64(&q.running) <= atomic.LoadInt64(&q.selfStops)
 }
 
 func (q *taskQueue[T]) isStopped() bool {
@@ -677,6 +755,8 @@ func (q *taskQueue[T]) spawnLocked() {
 // removeLocked drops a worker from the registry and returns its block to the
 // pool. The caller holds mu and has already taken the worker out of live.
 func (q *taskQueue[T]) removeLocked(w *worker[T]) {
+	w.parked = false
+	atomic.StoreInt64(&w.goid, 0)
 	last := len(q.workers) - 1
 	moved := q.workers[last]
 	q.workers[w.index] = moved
@@ -706,6 +786,7 @@ const (
 // stops making progress. After a rescue the owner handles tasks singly for
 // a while; after each claim it yields excess running slots as before.
 func (q *taskQueue[T]) worker(w *worker[T]) {
+	atomic.StoreInt64(&w.goid, goid.Get())
 	q.runWorker(w, 1)
 }
 
@@ -832,6 +913,13 @@ func (q *taskQueue[T]) rescueBatchLocked(w *worker[T], observed uint64) int {
 	if w.stuckTicks < batchRescueTicks || q.opt.maxBatchSize <= 1 || q.opt.concurrency <= 1 {
 		return 0
 	}
+	return q.claimBatchLocked(w, observed)
+}
+
+// claimBatchLocked moves the unstarted tail of w's batch, as observed, back to
+// the ingress queue and reports how many tasks it moved; it moves nothing when
+// the owner has advanced past observed. The caller holds mu.
+func (q *taskQueue[T]) claimBatchLocked(w *worker[T], observed uint64) int {
 	held := int32(observed)
 	if held <= 0 || !atomic.CompareAndSwapUint64(&w.state, observed, observed&^workerHeldMask|uint64(batchRescuing)) {
 		return 0
@@ -1261,11 +1349,19 @@ func (q *taskQueue[T]) parkLocked(w *worker[T]) {
 	q.ensureJanitorLocked()
 }
 
-// retire removes a worker that has already been taken out of live.
+// retire removes a parked worker that was told to exit: dismissed by Stop or
+// expired by the janitor. It stays live, and parked, until it gets here, so a
+// replacement never starts beside a worker that is still on its way out.
+// A task that arrived while the limit still counted it may be waiting for
+// the slot it frees.
 func (q *taskQueue[T]) retire(w *worker[T]) {
 	q.mu.Lock()
+	q.live--
 	q.removeLocked(w)
 	q.mu.Unlock()
+	if q.readyAny() {
+		q.dispatch(1)
+	}
 }
 
 // shed gives up a running slot while more workers run than the target allows,
@@ -1316,12 +1412,24 @@ func (q *taskQueue[T]) ensureJanitorLocked() {
 	}
 }
 
+// janitor reclaims expired workers every maxIdle until no worker is parked,
+// or until Stop, which dismisses the parked workers itself.
 func (q *taskQueue[T]) janitor() {
+	timer := time.NewTimer(q.opt.maxIdle)
+	defer timer.Stop()
 	for {
-		time.Sleep(q.opt.maxIdle)
+		select {
+		case <-timer.C:
+		case <-q.stopping:
+			q.mu.Lock()
+			q.janitorRunning = false
+			q.mu.Unlock()
+			return
+		}
 		if q.cleanExpired(q.opt.nowFn()) {
 			return
 		}
+		timer.Reset(q.opt.maxIdle)
 	}
 }
 
@@ -1333,18 +1441,16 @@ func (q *taskQueue[T]) cleanExpired(now time.Time) (stop bool) {
 	dst := 0
 	for _, w := range q.idle {
 		if now.Sub(w.lastUsed) >= q.opt.maxIdle {
-			w.parked = false
-			expired = append(expired, w)
-		} else {
-			q.idle[dst] = w
-			dst++
+			expired = append(expired, w) // live and parked until it retires
+			continue
 		}
+		q.idle[dst] = w
+		dst++
 	}
 	for i := dst; i < len(q.idle); i++ {
 		q.idle[i] = nil
 	}
 	q.idle = q.idle[:dst]
-	q.live -= len(expired)
 	if len(q.idle) == 0 {
 		q.janitorRunning = false
 		stop = true

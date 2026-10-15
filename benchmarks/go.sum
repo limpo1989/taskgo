@@ -4,6 +4,8 @@ github.com/lxzan/concurrency v1.4.3 h1:rqy+PY8aMyaHO/K384EE1mf1WWTO5mBYj/TGSzUEH
 github.com/lxzan/concurrency v1.4.3/go.mod h1:40ffys2wHpbUHtNztACL0xnjVkRLJ5Ej6b0EDzZVNdo=
 github.com/lxzan/dao v1.1.12 h1:TMvCwhFVzZV6c9upFxXXoiPD5wDKIYgzIYoC5KE//yc=
 github.com/lxzan/dao v1.1.12/go.mod h1:5ChTIo7RSZ4upqRo16eicJ3XdJWhGwgMIsyuGLMUofM=
+github.com/petermattis/goid v0.0.0-20260918085751-abfca077860b h1:OzNsuVdSWGwXvWKTtChx9ve89k4cFJ6NxYM4Aw4/f+E=
+github.com/petermattis/goid v0.0.0-20260918085751-abfca077860b/go.mod h1:pxMtw7cyUw6B2bRH0ZBANSPg+AoSud1I1iyJHI69jH4=
 github.com/pmezard/go-difflib v1.0.0 h1:4DBwDE0NGyQoBHbLQYPwSUPoCMWR5BEzIk/f1lZbAQM=
 github.com/pmezard/go-difflib v1.0.0/go.mod h1:iKH77koFhYxTK1pcRnkKkqfTogsbg7gZNVY4sRDYZ/4=
 github.com/stretchr/testify v1.8.4 h1:CcVxjf3Q8PM0mHUKJCdn+eZZtm5yQwehR5yeSVQQcUk=
