@@ -273,8 +273,8 @@ type taskQueue[T any] struct {
 	// stopping is closed once the first Stop has refused new submissions and
 	// dismissed the parked workers; every Stop waits for it before it waits
 	// for the queue to drain, and the janitor exits on it. selfStops counts
-	// the Stop calls waiting from inside a task of this queue, whose own
-	// workers the drain cannot wait for.
+	// the Stop calls waiting from inside a task of this queue after handing
+	// off their batches. Only task callers exclude those workers.
 	stopping  chan struct{}
 	selfStops int64 // atomic
 
@@ -391,12 +391,13 @@ var ErrStopInTask = errors.New("taskgo: Stop called from a task cannot wait for 
 // by ctx and WithTimeout is reached. Stop returns nil on a clean drain, or the
 // context error on timeout or cancellation.
 //
-// Every call waits, the ones made while another is still waiting and the ones
-// made after a call that timed out included, and returns nil only once the
-// queue has drained. A task, or the panic handler, may call Stop: it waits for
-// every other task, the ones queued behind the calling task included, but not
-// for the task it is called from, which is still running when it returns; it
-// returns ErrStopInTask if those tasks can run only after it has returned.
+// Every external call waits for all tasks to finish, including tasks that
+// call Stop themselves, even after another call has timed out. A task or the
+// panic handler may call Stop: that call excludes itself and tasks concurrently
+// waiting in Stop, preventing self and mutual waits. It hands off its unstarted
+// batch and waits for the remaining tasks, returning ErrStopInTask when the
+// concurrency limit prevents them from running until a stopping task returns.
+// An external Stop also waits for any code those tasks run after Stop returns.
 func (q *taskQueue[T]) Stop(ctx context.Context) error {
 	ctx, cancel := context.WithTimeout(ctx, q.opt.timeout)
 	defer cancel()
@@ -406,11 +407,6 @@ func (q *taskQueue[T]) Stop(ctx context.Context) error {
 	q.stopped = true
 	self := q.callerWorkerLocked()
 	q.mu.Unlock()
-	if self != nil {
-		atomic.AddInt64(&q.selfStops, 1)
-		defer atomic.AddInt64(&q.selfStops, -1)
-	}
-
 	if first {
 		q.beginStop()
 	} else {
@@ -424,15 +420,17 @@ func (q *taskQueue[T]) Stop(ctx context.Context) error {
 		// The calling task's worker runs the rest of its batch only once the
 		// task returns: hand that rest to the other workers.
 		q.handOffHeld(self)
+		defer atomic.AddInt64(&q.selfStops, -1)
 	}
 
 	ticker := time.NewTicker(stopCheckInterval)
 	defer ticker.Stop()
 	for {
-		if q.finished() {
+		done, blocked := q.stopState(self != nil)
+		if done {
 			return nil
 		}
-		if self != nil && atomic.LoadInt64(&q.selfStops) >= int64(q.opt.concurrency) {
+		if blocked {
 			// Every worker the limit allows is a task waiting here: what is
 			// left runs only once those tasks return.
 			return ErrStopInTask
@@ -440,7 +438,7 @@ func (q *taskQueue[T]) Stop(ctx context.Context) error {
 		select {
 		case <-ticker.C:
 		case <-ctx.Done():
-			if q.finished() {
+			if done, _ := q.stopState(self != nil); done {
 				return nil
 			}
 			return ctx.Err()
@@ -489,14 +487,15 @@ func (q *taskQueue[T]) callerWorkerLocked() *worker[T] {
 
 // handOffHeld returns the unstarted tail of the batch the calling task
 // came from to the ingress queue, and makes sure workers come for it, as the
-// monitor's rescue of a stalled batch does: the worker would reach those
-// tasks only after the task that is waiting for them.
+// monitor's rescue of a stalled batch does. It registers the caller's Stop
+// only after the tail is visible to other workers, under the same lock.
 func (q *taskQueue[T]) handOffHeld(w *worker[T]) {
 	q.mu.Lock()
 	n := 0
 	if state := atomic.LoadUint64(&w.state); int32(state) > 0 {
 		n = q.claimBatchLocked(w, state)
 	}
+	atomic.AddInt64(&q.selfStops, 1)
 	q.mu.Unlock()
 	if n > 0 {
 		q.dispatch(n)
@@ -504,9 +503,22 @@ func (q *taskQueue[T]) handOffHeld(w *worker[T]) {
 }
 
 func (q *taskQueue[T]) finished() bool {
-	// The workers whose tasks wait in Stop are running, and stay running
-	// until Stop returns.
-	return q.lenAny() == 0 && atomic.LoadInt64(&q.running) <= atomic.LoadInt64(&q.selfStops)
+	return q.lenAny() == 0 && atomic.LoadInt64(&q.running) == 0
+}
+
+// stopState keeps task exclusions and the handoff of held batches in one
+// snapshot. External callers wait for every worker, including task callers.
+func (q *taskQueue[T]) stopState(inTask bool) (done, blocked bool) {
+	if !inTask {
+		return q.finished(), false
+	}
+	q.mu.Lock()
+	defer q.mu.Unlock()
+	queued := q.lenAny()
+	waiting := atomic.LoadInt64(&q.selfStops)
+	running := atomic.LoadInt64(&q.running)
+	return queued == 0 && running <= waiting,
+		queued > 0 && waiting >= int64(q.opt.concurrency)
 }
 
 func (q *taskQueue[T]) isStopped() bool {
@@ -1248,27 +1260,33 @@ func (q *taskQueue[T]) popWorkerBatch(w *worker[T], dst []taskItem[T]) (int, boo
 	if atomic.LoadInt32(&q.orphans) > 0 {
 		q.claimOrphan(w)
 	}
-	own := int(atomic.LoadInt32(&w.ring))
-	if k, contended := q.rings[own].popBatch(dst); k > 0 {
+	if k, contended := q.rings[atomic.LoadInt32(&w.ring)].popBatch(dst); k > 0 {
 		return k, contended
-	}
-	if q.settleEmpty(own) {
-		if k, contended := q.rings[own].popBatch(dst); k > 0 {
-			return k, contended
-		}
 	}
 	return q.scanBatch(w, dst)
 }
 
 // scanBatch takes a batch from the first shard holding tasks and makes that
-// shard the worker's own. It looks only at the shards marked in occupied, and
-// settles a marked shard it finds empty, so a worker that finds no work reads
-// a word per 64 shards rather than every shard's queue. Successive scans of a
-// worker start at successive shards, from an offset that differs per worker,
-// so scanning workers spread over the shards.
+// shard the worker's own. It looks only at the shards marked in occupied, so a
+// worker that finds no work reads a word per 64 shards rather than every
+// shard's queue. A marked shard found empty keeps its mark while the scan
+// goes on: under load the next scan finds work and clearing would only move
+// the word between CPUs. Only a scan that found nothing settles the marks it
+// passed, on the way to parking, so the marks idle workers read stay
+// accurate. Successive scans of a worker start at successive shards, from an
+// offset that differs per worker, so scanning workers spread over the shards.
 func (q *taskQueue[T]) scanBatch(w *worker[T], dst []taskItem[T]) (int, bool) {
 	w.scans++
 	start := int((w.seed + w.scans) % uint32(q.shards))
+	if k, contended := q.scanFrom(w, dst, start, false); k > 0 {
+		return k, contended
+	}
+	return q.scanFrom(w, dst, start, true)
+}
+
+// scanFrom is one pass of scanBatch over the marked shards from start on,
+// settling the empty ones when settle is set.
+func (q *taskQueue[T]) scanFrom(w *worker[T], dst []taskItem[T], start int, settle bool) (int, bool) {
 	words := len(q.occupied)
 	first, below := start/64, uint64(1)<<(start%64)-1
 	// The word holding start is visited twice, its bits from start on first
@@ -1285,7 +1303,7 @@ func (q *taskQueue[T]) scanBatch(w *worker[T], dst []taskItem[T]) (int, bool) {
 		for ; marks != 0; marks &= marks - 1 {
 			r := word*64 + bits.TrailingZeros64(marks)
 			k, contended := q.rings[r].popBatch(dst)
-			if k == 0 && q.settleEmpty(r) {
+			if k == 0 && settle && q.settleEmpty(r) {
 				k, contended = q.rings[r].popBatch(dst)
 			}
 			if k > 0 {

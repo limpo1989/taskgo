@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"runtime"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -193,6 +194,211 @@ func TestConcurrentStopsWaitForTheDrain(t *testing.T) {
 		case <-time.After(2 * time.Second):
 			t.Fatal("a Stop did not return once the queue drained")
 		}
+	}
+}
+
+// An external Stop includes a task waiting in Stop and any work that task
+// does after its own Stop returns. Its deadline must not turn into success
+// merely because all remaining workers are waiting inside Stop.
+func TestExternalStopWaitsForTaskCallingStop(t *testing.T) {
+	blockerStarted, blockerRelease := make(chan struct{}), make(chan struct{})
+	taskRelease := make(chan struct{})
+	releaseBlocker := sync.OnceFunc(func() { close(blockerRelease) })
+	releaseTask := sync.OnceFunc(func() { close(taskRelease) })
+	result := make(chan error, 1)
+	q := New(WithConcurrency(2), WithMaxBatchSize(1), WithTimeout(2*time.Second))
+	t.Cleanup(func() {
+		releaseBlocker()
+		releaseTask()
+		q.Stop(context.Background())
+	})
+	q.Push(func() { close(blockerStarted); <-blockerRelease })
+	<-blockerStarted
+	q.Push(func() {
+		result <- q.Stop(context.Background())
+		<-taskRelease
+	})
+	waitFor(t, time.Second, func() bool { return atomic.LoadInt64(&q.selfStops) == 1 })
+	releaseBlocker()
+	waitFor(t, time.Second, func() bool { return q.runningCount() == 1 })
+
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Millisecond)
+	defer cancel()
+	if err := q.Stop(ctx); !errors.Is(err, context.DeadlineExceeded) {
+		t.Errorf("external Stop = %v with the stopping task still running, want DeadlineExceeded", err)
+	}
+	select {
+	case err := <-result:
+		if err != nil {
+			t.Fatalf("Stop from the task = %v, want nil", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("task Stop waited for itself or the external Stop")
+	}
+	// Even after the inner Stop returns, the task itself has not returned.
+	ctx2, cancel2 := context.WithTimeout(context.Background(), 20*time.Millisecond)
+	defer cancel2()
+	if err := q.Stop(ctx2); !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("external Stop = %v before the task returned, want DeadlineExceeded", err)
+	}
+	releaseTask()
+	if err := q.Stop(context.Background()); err != nil {
+		t.Fatalf("Stop after the task returned = %v, want nil", err)
+	}
+}
+
+// A producer finishing its dispatch keeps stop initialization open while two
+// tasks call Stop. The second task owns a batch: excluding its worker before
+// handing off that batch would let the first Stop overlook unstarted tasks.
+func TestTaskStopWaitsForOtherStoppingWorkersBatch(t *testing.T) {
+	oldProcs := runtime.GOMAXPROCS(1)
+	defer runtime.GOMAXPROCS(oldProcs)
+	firstStarted, secondStarted := make(chan struct{}), make(chan struct{})
+	firstStop, secondStop := make(chan struct{}), make(chan struct{})
+	stopFirst := sync.OnceFunc(func() { close(firstStop) })
+	stopSecond := sync.OnceFunc(func() { close(secondStop) })
+	type result struct {
+		task int
+		err  error
+		done int32
+	}
+	results := make(chan result, 2)
+	var completed atomic.Int32
+	var q *Task[int]
+	q = NewTask(func(v int) {
+		switch v {
+		case 0:
+			close(firstStarted)
+			<-firstStop
+		case 1:
+			close(secondStarted)
+			<-secondStop
+		default:
+			completed.Add(1)
+			return
+		}
+		err := q.Stop(context.Background())
+		results <- result{v, err, completed.Load()}
+	}, WithConcurrency(2), WithTimeout(2*time.Second))
+	// Pin both slots and suppress the monitor so it cannot rescue the held
+	// tail ahead of Stop. Returning either task suffices to drain this work.
+	q.setBaseForTest(2)
+	atomic.StoreUint32(&q.monitorOn, 1)
+	if !q.enter() {
+		t.Fatal("producer rejected")
+	}
+	leaveProducer := sync.OnceFunc(q.leave)
+	t.Cleanup(func() {
+		stopFirst()
+		stopSecond()
+		leaveProducer()
+		q.Stop(context.Background())
+		atomic.StoreUint32(&q.monitorOn, 0)
+	})
+	q.Push(0)
+	<-firstStarted
+	q.queue.pushN(defaultMaxBatchSize, func(i int) taskItem[int] {
+		return taskItem[int]{value: i + 1}
+	})
+	startBatchWorkerForTest(q.taskQueue)
+	<-secondStarted
+	stopFirst()
+	waitFor(t, time.Second, q.isStopped)
+	stopSecond()
+	// With one P the first task yields while waiting for the producer, giving
+	// the second task a turn to enter Stop before initialization completes.
+	for range 10 {
+		runtime.Gosched()
+	}
+	leaveProducer()
+	for range 2 {
+		select {
+		case r := <-results:
+			if r.err == nil && r.done != defaultMaxBatchSize-1 {
+				t.Errorf("task %d Stop returned nil with %d/%d batch tasks completed", r.task, r.done, defaultMaxBatchSize-1)
+			}
+			if r.err != nil && !errors.Is(r.err, ErrStopInTask) {
+				t.Errorf("task %d Stop = %v, want nil or ErrStopInTask", r.task, r.err)
+			}
+		case <-time.After(time.Second):
+			t.Fatal("tasks calling Stop did not release a worker for the held batch")
+		}
+	}
+	if err := q.Stop(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if got := completed.Load(); got != defaultMaxBatchSize-1 {
+		t.Fatalf("completed %d batch tasks, want %d", got, defaultMaxBatchSize-1)
+	}
+}
+
+// Concurrent task callers exclude one another, but keep the concurrency cap:
+// when all slots are waiting in Stop, one must return ErrStopInTask so queued
+// work can run. Without queued work every caller can return nil.
+func TestMultipleTasksCallStop(t *testing.T) {
+	for _, queued := range []int{0, 7} {
+		name := "empty"
+		if queued > 0 {
+			name = "queued"
+		}
+		t.Run(name, func(t *testing.T) {
+			const workers = 3
+			gate := make(chan struct{})
+			release := sync.OnceFunc(func() { close(gate) })
+			started := make(chan struct{}, workers)
+			results := make(chan error, workers)
+			var completed atomic.Int32
+			var q *Task[int]
+			q = NewTask(func(v int) {
+				if v >= workers {
+					completed.Add(1)
+					return
+				}
+				started <- struct{}{}
+				<-gate
+				results <- q.Stop(context.Background())
+			}, WithConcurrency(workers), WithMaxBatchSize(1), WithTimeout(2*time.Second))
+			t.Cleanup(func() { release(); q.Stop(context.Background()) })
+			for i := range workers {
+				q.Push(i)
+			}
+			for range workers {
+				select {
+				case <-started:
+				case <-time.After(time.Second):
+					t.Fatal("workers did not start")
+				}
+			}
+			for i := range queued {
+				q.Push(workers + i)
+			}
+			release()
+			blocked := 0
+			for range workers {
+				select {
+				case err := <-results:
+					if errors.Is(err, ErrStopInTask) {
+						blocked++
+					} else if err != nil {
+						t.Fatalf("Stop = %v, want nil or ErrStopInTask", err)
+					}
+				case <-time.After(time.Second):
+					t.Fatal("tasks calling Stop waited for one another")
+				}
+			}
+			if (queued == 0 && blocked != 0) || (queued > 0 && blocked == 0) {
+				t.Fatalf("%d ErrStopInTask results with %d queued tasks", blocked, queued)
+			}
+			if err := q.Stop(context.Background()); err != nil {
+				t.Fatal(err)
+			}
+			if got := completed.Load(); got != int32(queued) {
+				t.Fatalf("completed %d queued tasks, want %d", got, queued)
+			}
+			if got := atomic.LoadInt64(&q.selfStops); got != 0 {
+				t.Fatalf("selfStops = %d after drain, want 0", got)
+			}
+		})
 	}
 }
 
