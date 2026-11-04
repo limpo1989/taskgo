@@ -168,8 +168,14 @@ func (s *sizer) step(now int64, started, enqueued uint64, running, backlog, targ
 	}
 
 	if backlog == 0 {
-		// Nothing waits, so no window can judge a resize: keep the size.
-		s.stalled, s.probe = 0, probeNone
+		// Nothing waits, so no window can judge a resize: keep the size, and
+		// take an experiment left open as unproven, so the next burst does
+		// not grow by a factor an unfinished growth never earned.
+		s.stalled = 0
+		if s.probe != probeNone {
+			s.probe = probeNone
+			s.proven = false
+		}
 		s.resetWindow()
 		if s.idle++; s.idle > lingerTicks && target > s.base {
 			target -= (target-s.base)/4 + 1
@@ -353,13 +359,16 @@ func (s *sizer) judge(now int64, x float64, target int64) (int64, bool) {
 
 // stallLongEnough reports whether a stretch of ticks without a task start
 // is long for the tasks this queue runs: once windows have measured them, it
-// must have been long enough for the running workers to start a few.
+// must have been long enough for the running workers to start one more, which
+// long tasks that are merely running - not blocked - also deserve the target
+// for, since the tasks queued behind them need the workers all the same. The
+// window after the growth says whether it paid.
 func (s *sizer) stallLongEnough(dt, running int64) bool {
 	if s.sLast == 0 {
 		return true
 	}
 	expected := float64(s.stalled) * float64(dt) * float64(running) / s.sLast
-	return expected >= 3
+	return expected >= 1
 }
 
 func (s *sizer) clamp(n int64) int64 {

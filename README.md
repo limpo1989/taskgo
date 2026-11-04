@@ -157,8 +157,13 @@ interleave. Use `WithConcurrency(1)` when execution order must be strict.
 ## How it works
 
 Tasks wait in a lock-free FIFO queue: a chain of fixed-size rings that doubles
-when full and shrinks back once a burst has drained. Submitting publishes the
-task and then checks whether enough workers are running:
+when full and shrinks back once a burst has drained. While submitters do not
+contend for it, every task waits in that one FIFO and starts in submission
+order; once they do, an unkeyed queue whose ceiling allows it spreads them
+over one FIFO per P, and tasks then start in the order workers take them from
+those FIFOs - close to, but not strictly, submission order. (`WithConcurrency`
+below 16 keeps the single FIFO; keyed queues order within a shard.) Submitting
+publishes the task and then checks whether enough workers are running:
 
 1. **Enough workers are running** (the normal case under load) → nothing else
    to do. The submitter takes no lock and never blocks, so an event loop that
