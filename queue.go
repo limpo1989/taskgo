@@ -1347,10 +1347,6 @@ func (q *taskQueue[T]) eachIngress(visit func(*lfQueue[taskItem[T]])) {
 		visit(&q.queue)
 		return
 	}
-	if q.shards <= 1 {
-		visit(&q.queue)
-		return
-	}
 	if !q.keyed {
 		visit(&q.queue)
 	}
