@@ -127,8 +127,6 @@ const watchCredit = 20 * time.Millisecond
 // allocates.
 const shardBatch = 64
 
-var monoEpoch = time.Now()
-
 const (
 	// monitorTick is the period of the monitor that runs while tasks are
 	// waiting for a worker.
@@ -650,9 +648,6 @@ func (q *taskQueue[T]) leaveAt(p int) {
 	}
 }
 
-func (q *taskQueue[T]) enter() bool { return q.enterAt(0) }
-func (q *taskQueue[T]) leave()      { q.leaveAt(0) }
-
 // pushRun is how many pushes a submitter makes to one shard before it moves
 // on to the next; see shardAt.
 const pushRun = 64
@@ -668,7 +663,7 @@ func (q *taskQueue[T]) shardAt(value T, p int) uint32 {
 	case q.shards <= 1:
 		return 0
 	case q.keyed:
-		return q.keyFn(value) % uint32(q.shards)
+		return q.shardIndex(value)
 	case p == 0:
 		return 0
 	default:
@@ -713,10 +708,7 @@ func (q *taskQueue[T]) pushRun(values []T, shards []uint32, submitted bool, p in
 		}
 	case q.shards > 1 && q.spread():
 		// p is the submitter's P; see place.
-		r := 0
-		if p != 0 {
-			r = p % q.shards
-		}
+		r := int(q.shardOfPlace(p))
 		q.rings[r].pushN(len(values), func(i int) taskItem[T] {
 			return taskItem[T]{value: values[i], submitted: submitted}
 		})
@@ -1214,8 +1206,12 @@ func (q *taskQueue[T]) shardIndex(value T) uint32 {
 
 // localShard is the shard of the P the caller runs on, for an unkeyed queue
 // sharded by P.
-func (q *taskQueue[T]) localShard() uint32 {
-	return uint32(currentP()) % uint32(q.shards)
+func (q *taskQueue[T]) localShard() uint32 { return q.shardOfPlace(currentP()) }
+
+// shardOfPlace is the shard of place p, the P a submission is made on or a
+// worker runs on, for an unkeyed queue sharded by P.
+func (q *taskQueue[T]) shardOfPlace(p int) uint32 {
+	return uint32(p) % uint32(q.shards)
 }
 
 // shardIndexes runs shardIndex over values ahead of a batch's admission, into
@@ -1302,63 +1298,46 @@ func (q *taskQueue[T]) readyAny() bool {
 }
 
 // lenAny totals the tasks waiting across the ingress queues.
-func (q *taskQueue[T]) lenAny() int {
+// eachIngress visits every ingress queue holding tasks: the single queue,
+// when it is one of them, and every shard. Keyed queues keep no tasks in the
+// single queue.
+func (q *taskQueue[T]) eachIngress(visit func(*lfQueue[taskItem[T]])) {
 	if q.shards <= 1 {
-		return q.queue.len()
+		visit(&q.queue)
+		return
 	}
-	n := 0
 	if !q.keyed {
-		n = q.queue.len()
+		visit(&q.queue)
 	}
 	for i := range q.rings {
-		n += q.rings[i].len()
+		visit(&q.rings[i])
 	}
+}
+
+func (q *taskQueue[T]) lenAny() int {
+	n := 0
+	q.eachIngress(func(r *lfQueue[taskItem[T]]) { n += r.len() })
 	return n
 }
 
 // enqueuedAny totals the tasks ever enqueued across the ingress queues.
 func (q *taskQueue[T]) enqueuedAny() uint64 {
-	if q.shards <= 1 {
-		return q.queue.enqueued()
-	}
 	var n uint64
-	if !q.keyed {
-		n = q.queue.enqueued()
-	}
-	for i := range q.rings {
-		n += q.rings[i].enqueued()
-	}
+	q.eachIngress(func(r *lfQueue[taskItem[T]]) { n += r.enqueued() })
 	return n
 }
 
 // dequeuedAny totals the tasks ever taken from the ingress queues, which is
 // how many tasks workers have started or hold in a batch.
 func (q *taskQueue[T]) dequeuedAny() uint64 {
-	if q.shards <= 1 {
-		return q.queue.dequeued()
-	}
 	var n uint64
-	if !q.keyed {
-		n = q.queue.dequeued()
-	}
-	for i := range q.rings {
-		n += q.rings[i].dequeued()
-	}
+	q.eachIngress(func(r *lfQueue[taskItem[T]]) { n += r.dequeued() })
 	return n
 }
 
 // shrinkAll retires spare capacity in every ingress queue.
 func (q *taskQueue[T]) shrinkAll() {
-	if q.shards <= 1 {
-		q.queue.shrink(ringKeep)
-		return
-	}
-	if !q.keyed {
-		q.queue.shrink(ringKeep)
-	}
-	for i := range q.rings {
-		q.rings[i].shrink(ringKeep)
-	}
+	q.eachIngress(func(r *lfQueue[taskItem[T]]) { r.shrink(ringKeep) })
 }
 
 // tailSmallEnough reports whether every ingress queue is already down to the
@@ -1376,7 +1355,7 @@ func (q *taskQueue[T]) tailSmallEnough() bool {
 }
 
 // monoNow reads the monotonic clock in nanoseconds.
-func monoNow() int64 { return int64(time.Since(monoEpoch)) }
+func monoNow() int64 { return nanotime() }
 
 // tryWatch runs watchShards unless one is running or the last one was less
 // than a monitor tick ago. The monitor calls it every tick and workers every
@@ -1920,7 +1899,7 @@ func (q *taskQueue[T]) monitor() {
 	q.mu.Unlock()
 	sz := newSizer(base, int64(q.opt.concurrency), nanotime(), q.dequeuedAny(), q.enqueuedAny())
 	quiet, behind := 0, 0
-	lastTail, lastStarted, lastBacklog := q.enqueuedAny(), q.dequeuedAny(), int64(q.lenAny())
+	lastBacklog := int64(q.lenAny())
 	for {
 		time.Sleep(monitorTick)
 		if q.keyed {
@@ -1943,13 +1922,13 @@ func (q *taskQueue[T]) monitor() {
 		running := atomic.LoadInt64(&q.running)
 		target := sz.step(nanotime(), started-uint64(held), tail, running, backlog, atomic.LoadInt64(&q.target))
 
-		arrivals, progress := int64(tail-lastTail), int64(started-lastStarted)
+		arrivals, progress := sz.tickArrivals, sz.tickProgress
 		if backlog > lastBacklog && arrivals > 2*progress {
 			behind++
 		} else {
 			behind = 0
 		}
-		lastTail, lastStarted, lastBacklog = tail, started, backlog
+		lastBacklog = backlog
 		if behind >= behindTicks && backlog > throttleBacklog {
 			atomic.StoreUint32(&q.throttle, 1)
 		} else if backlog < throttleBacklog/2 && atomic.LoadUint32(&q.throttle) != 0 {

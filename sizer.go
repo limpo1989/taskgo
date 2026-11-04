@@ -111,6 +111,11 @@ type sizer struct {
 	stalled     int
 	idle        int
 
+	// tickArrivals and tickProgress are the arrivals and task starts of the
+	// last step's tick, for the monitor's own decisions.
+	tickArrivals uint64
+	tickProgress uint64
+
 	settleUntil int64
 	winDT       int64
 	winWork     float64 // worker-nanoseconds
@@ -157,6 +162,7 @@ func (s *sizer) step(now int64, started, enqueued uint64, running, backlog, targ
 		arrivals, s.lastEnq = enqueued-s.lastEnq, enqueued
 	}
 	s.lastNow = now
+	s.tickArrivals, s.tickProgress = arrivals, progress
 	if dt <= 0 {
 		return target
 	}

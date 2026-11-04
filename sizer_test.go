@@ -143,10 +143,3 @@ func TestSizerLingersThenSheds(t *testing.T) {
 		t.Fatalf("target = %d after the load stopped, want the base 8", target)
 	}
 }
-
-func assertWithin(t *testing.T, got, lo, hi int64, what string) {
-	t.Helper()
-	if got < lo || got > hi {
-		t.Fatalf("target = %d %s, want %d..%d", got, what, lo, hi)
-	}
-}

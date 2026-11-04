@@ -41,24 +41,23 @@ const publishSpins = 64
 const casRetries = 4
 
 // backoff counts a lost CAS race and yields after casRetries of them.
-func backoff(fails *int) {
+func backoff(fails *int) { backoffWith(fails, nil) }
+
+// backoffWith is backoff that reports the contention it met to onContention,
+// when not nil, once the CAS races it lost were enough to yield.
+func backoffWith(fails *int, onContention func()) {
 	if *fails++; *fails >= casRetries {
 		*fails = 0
+		if onContention != nil {
+			onContention()
+		}
 		runtime.Gosched()
 	}
 }
 
 // backoffContention is backoff for a producer that reports the contention it
 // met to the queue the ring belongs to (see lfQueue.onContention).
-func (q *lfQueue[T]) backoffContention(fails *int) {
-	if *fails++; *fails >= casRetries {
-		*fails = 0
-		if q.onContention != nil {
-			q.onContention()
-		}
-		runtime.Gosched()
-	}
-}
+func (q *lfQueue[T]) backoffContention(fails *int) { backoffWith(fails, q.onContention) }
 
 // lfQueue is an unbounded multi-producer multi-consumer FIFO queue.
 //

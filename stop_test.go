@@ -284,10 +284,10 @@ func TestTaskStopWaitsForOtherStoppingWorkersBatch(t *testing.T) {
 	// tail ahead of Stop. Returning either task suffices to drain this work.
 	q.setBaseForTest(2)
 	atomic.StoreUint32(&q.monitorOn, 1)
-	if !q.enter() {
+	if !q.enterAt(0) {
 		t.Fatal("producer rejected")
 	}
-	leaveProducer := sync.OnceFunc(q.leave)
+	leaveProducer := sync.OnceFunc(func() { q.leaveAt(0) })
 	t.Cleanup(func() {
 		stopFirst()
 		stopSecond()
