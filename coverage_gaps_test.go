@@ -191,9 +191,12 @@ func TestShedParksOrRetires(t *testing.T) {
 func TestReadyAfterPopSeesSingleQueue(t *testing.T) {
 	q := New(WithConcurrency(64))
 	tq := q.taskQueue
+	if tq.shards < 2 {
+		t.Skipf("needs room for two shards, have %d", tq.shards)
+	}
 	atomic.StoreUint32(&tq.contended, 1)
 	w := &worker[Job]{}
-	atomic.StoreInt32(&w.ring, 3)
+	atomic.StoreInt32(&w.ring, int32(tq.shards-1))
 	if tq.readyAfterPop(w) {
 		t.Fatal("readyAfterPop saw work on an empty queue")
 	}

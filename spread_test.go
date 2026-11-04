@@ -60,7 +60,10 @@ func TestUnkeyedSpreadDrainsSingleQueue(t *testing.T) {
 	atomic.StoreUint32(&tq.contended, 1)
 	var stream sync.WaitGroup
 	stop := make(chan struct{})
+	stopped := make(chan struct{})
 	go func() {
+		// The done signal comes first, so no Add follows the Wait below.
+		defer close(stopped)
 		for {
 			select {
 			case <-stop:
@@ -82,6 +85,7 @@ func TestUnkeyedSpreadDrainsSingleQueue(t *testing.T) {
 		t.Fatalf("%d of the single-FIFO tasks never ran", q.queue.len())
 	}
 	close(stop)
+	<-stopped
 	stream.Wait()
 	if err := q.Stop(context.Background()); err != nil {
 		t.Fatal(err)
