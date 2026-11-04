@@ -166,6 +166,13 @@ type producerStripe struct {
 // maxProducerStripes bounds the stripes of a queue sharded over many Ps.
 const maxProducerStripes = 64
 
+// turnStripe counts one submitter stripe's pushes, on a line of its own so
+// that submitters on different Ps do not pass it between them.
+type turnStripe struct {
+	n uint32 // atomic
+	_ [cacheLinePad - 4]byte
+}
+
 // worker is one worker goroutine's control block. The fields written for
 // every task are padded so that workers never share those cache lines.
 type worker[T any] struct {
@@ -192,6 +199,10 @@ type worker[T any] struct {
 	scans     uint32
 	seed      uint32
 	claimTick uint32
+
+	// lastEnd is when the worker last finished a task, from nanotime; a
+	// worker that just finished one spins for its next instead of parking.
+	lastEnd int64
 
 	// Guarded by taskQueue.mu.
 	lastUsed   int64  // q.nowNanos when it parked
@@ -232,36 +243,39 @@ func (w *worker[T]) initBatch(n int) {
 // block, up to the concurrency limit, which remains the hard cap on live
 // workers.
 type taskQueue[T any] struct {
+	// The control words of one task's round trip share a line: a submitter
+	// reads running and target and may write running when it wakes a worker,
+	// the woken worker releases running when it parks, and the monitor moves
+	// target now and then. They travel between cores together anyway, so
+	// one line moves per task rather than one per word.
 	running   int64 // atomic: workers not parked; written under mu
-	_         [cacheLinePad - 8]byte
+	target    int64 // atomic: soft limit on running workers
+	seekers   int32 // atomic: workers woken or started and yet to reach the queue, or spinning on it
+	spinners  int32 // atomic: the spinning ones
+	monitorOn uint32
+	throttle  uint32 // atomic: submitters yield after submitting; see throttleBacklog
+	_         [cacheLinePad - 32]byte
 	closed    int64 // atomic: set once Stop refuses new submissions
 	_         [cacheLinePad - 8]byte
+	// base is the target without the monitor's compensation; never written
+	// after construction.
+	base      int64
 	producers []producerStripe
+	pushTurn  []turnStripe
 	pending   int64 // atomic: outstanding Submit tasks
 	_         [cacheLinePad - 8]byte
 	// contended is set once producers have lost races claiming slots in the
 	// single queue they share, which more than one producer at work does. An
-	// unkeyed queue then spreads its producers over the shards of their Ps
-	// (see shardAt), for good: until then every submitter uses the single
-	// queue, so that a lone submitter - and a quiet one - pays nothing for
-	// the shards, and its tasks sit together where every worker finds them.
+	// unkeyed queue then spreads its producers over the shards (see shardAt),
+	// for good: until then every submitter uses the single queue, so that a
+	// lone submitter - and a quiet one - pays nothing for the shards, and its
+	// tasks sit together where every worker finds them.
 	contended uint32 // atomic
-	_         [cacheLinePad - 8]byte
 	_         [cacheLinePad - 8]byte
 	// holders counts the workers holding the unstarted tail of a batch. The
 	// monitor scans the workers for stalled batches only while it is not zero.
 	holders int64 // atomic
 	_       [cacheLinePad - 8]byte
-	// seekers counts the workers on their way to the queue: woken or started
-	// and yet to look at it, or spinning on it. Submitters leave their tasks
-	// to them. spinners counts the spinning ones.
-	seekers   int32 // atomic
-	spinners  int32 // atomic
-	_         [cacheLinePad - 8]byte
-	target    int64 // atomic: soft limit on running workers
-	base      int64 // target without the monitor's compensation
-	monitorOn uint32
-	throttle  uint32 // atomic: submitters yield after submitting; see throttleBacklog
 	// Keyed queues only. orphans counts the bits set in orphaned, one per
 	// shard found unattended; every pop reads it. ticks counts the watches,
 	// all of them, and paces the claims; monTicks counts the monitor's own
@@ -337,6 +351,7 @@ func newShardedTaskQueue[T any](opts []Option, run func(T), key func(T) uint32, 
 		}
 	}
 	q.producers = make([]producerStripe, stripes)
+	q.pushTurn = make([]turnStripe, stripes)
 	base := int64(autoWorkerLimit(o.concurrency))
 	q.base = base
 	q.target = base
@@ -638,10 +653,16 @@ func (q *taskQueue[T]) leaveAt(p int) {
 func (q *taskQueue[T]) enter() bool { return q.enterAt(0) }
 func (q *taskQueue[T]) leave()      { q.leaveAt(0) }
 
+// pushRun is how many pushes a submitter makes to one shard before it moves
+// on to the next; see shardAt.
+const pushRun = 64
+
 // shardAt is the ingress shard of value submitted on place p, or 0 when
-// unsharded. A keyed queue runs its key here. An unkeyed queue sharded by P
-// keeps every producer on the first shard until they contend for it (see
-// contended), so a lone submitter's tasks sit together.
+// unsharded. A keyed queue runs its key here. An unkeyed queue keeps every
+// producer on the single queue until they contend for it (see contended), so
+// a lone submitter's tasks sit together; once they spread, a submitter moves
+// to the next shard every pushRun pushes, so a few submitters' tasks reach
+// every shard and the workers that latch onto the shards spread with them.
 func (q *taskQueue[T]) shardAt(value T, p int) uint32 {
 	switch {
 	case q.shards <= 1:
@@ -652,7 +673,8 @@ func (q *taskQueue[T]) shardAt(value T, p int) uint32 {
 		return 0
 	default:
 		// p is the submitter's P, once producers spread; see place.
-		return uint32(p % q.shards)
+		turn := atomic.AddUint32(&q.pushTurn[p&(len(q.pushTurn)-1)].n, 1)
+		return (uint32(p) + turn/pushRun) % uint32(q.shards)
 	}
 }
 
@@ -829,14 +851,21 @@ func (q *taskQueue[T]) dispatch(n int) {
 		q.startMonitor()
 		return
 	}
-	if q.spread() && atomic.LoadInt32(&q.seekers) > 0 {
-		// A worker on its way to the queue, woken or spinning, takes the
-		// tasks, and one that finds more behind the one it took wakes others
-		// for them (see wakeMore). A seeker counts itself out before it looks
-		// at the queue, so it finds the tasks published before this load.
-		// Should the seekers block in their tasks before they look, the
-		// monitor sees the rest waiting.
-		q.startMonitor()
+	if q.spread() {
+		if atomic.LoadInt32(&q.seekers) > 0 {
+			// A worker on its way to the queue, woken or spinning, takes the
+			// tasks, and one that finds more behind the one it took wakes
+			// others for them (see wakeMore). A seeker counts itself out
+			// before it looks at the queue, so it finds the tasks published
+			// before this load. Should the seekers block in their tasks
+			// before they look, the monitor sees the rest waiting.
+			q.startMonitor()
+			return
+		}
+	} else if atomic.LoadInt32(&q.spinners) > 0 {
+		// A worker that just finished a task is looking for the next: it
+		// takes this one without a park or a wake-up. Should it stop looking
+		// first, it checks the queue once more before it parks.
 		return
 	}
 	q.wake(n)
@@ -1025,7 +1054,7 @@ func (q *taskQueue[T]) runWorker(w *worker[T], batch int) {
 		}
 		k, contended := q.popWorkerBatch(w, w.batch[:limit])
 		if k == 0 {
-			if q.spin() {
+			if q.spin(w) {
 				continue
 			}
 			batch = 1
@@ -1051,6 +1080,7 @@ func (q *taskQueue[T]) runWorker(w *worker[T], batch int) {
 		} else if !contended && batch > 1 {
 			batch--
 		}
+		w.lastEnd = nanotime()
 		completed, rescued := 1, false
 		if k == 1 {
 			item := w.batch[0]
@@ -1692,19 +1722,26 @@ func (q *taskQueue[T]) idleWorker(w *worker[T]) int {
 	return idleWoken
 }
 
-// spinNanos is how long a worker looks for tasks before it parks, while the
-// target has grown past twice its base: tasks that block keep many workers
-// cycling, and the next task usually arrives sooner than a park and a wake-up
-// would take, both of which go through mu.
-const spinNanos = 20_000
+// spinNanos is how long a worker that just finished a task looks for the
+// next one before it parks, and how recently it must have finished one to
+// look at all: a task that arrives while a worker spins is taken without a
+// park and a wake-up, both of which go through mu, and that is most of the
+// round trip of a lightly loaded queue. A worker idle for longer parks at
+// once rather than burn a P.
+const spinNanos = 5_000
 
 // spin looks for tasks without parking, for up to spinNanos, and reports
 // whether it found some. Only a quarter of the base target spins at once, and
 // only while the target is past twice its base: CPU-bound work, at its base,
 // leaves the CPU a spinning worker would take to other goroutines. A spinner
 // counts as a seeker, so submitters leave their tasks to it.
-func (q *taskQueue[T]) spin() bool {
-	if !q.spread() || atomic.LoadInt64(&q.target) < 2*q.base || atomic.LoadInt64(&q.running) >= atomic.LoadInt64(&q.target) {
+func (q *taskQueue[T]) spin(w *worker[T]) bool {
+	if atomic.LoadInt64(&q.running) >= atomic.LoadInt64(&q.target) {
+		// The workers there are cover the tasks: spin only while a woken
+		// worker is still expected, not to hold a surplus one.
+		return false
+	}
+	if w.lastEnd == 0 || nanotime()-w.lastEnd > spinNanos {
 		return false
 	}
 	limit := int32(q.base / 4)
@@ -1724,6 +1761,7 @@ func (q *taskQueue[T]) spin() bool {
 		runtime.Gosched()
 		found = q.readyAny()
 	}
+	w.lastEnd = 0
 	atomic.AddInt32(&q.seekers, -1)
 	atomic.AddInt32(&q.spinners, -1)
 	return found
