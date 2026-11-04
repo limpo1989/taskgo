@@ -188,25 +188,14 @@ for up to `maxIdle`, or exits when parking is disabled, the queue is stopped,
 or it has handled `maxJobs` tasks. Parked workers are excluded from the running
 count, so `Stop` can tell when all real work is done.
 
-**The running worker count follows the CPU, not the concurrency limit.** About
-one worker per P (`GOMAXPROCS`) runs tasks. Once every P is busy, more runnable
-workers add no throughput: they only lengthen the Go scheduler's run queues,
-and every goroutine in the process, including the ones submitting tasks, then
-waits longer for a CPU. A monitor goroutine, running only while tasks wait for
-a worker, adds workers when they help, that is when running workers block:
-
-- no task started during a 1 ms tick while workers are stuck in one: the target
-  doubles (tasks queued behind blocking tasks need that many workers);
-- tasks wait while the scheduler reports idle Ps: the target grows (Go 1.26+
-  reads the scheduler's runnable and running goroutine counts from
-  `runtime/metrics`; older runtimes use the monitor's own wake-up latency);
-- tasks arrive more than twice as fast as they start, with the backlog
-  growing: other goroutines are taking the CPU the workers need, and more
-  workers claim a larger share of it. Past 65,536 queued tasks, submitters also
-  yield their P after each submission until the backlog halves.
-
-The extra workers go again when the run queues get long or the blocked tasks
-finish. `WithConcurrency` stays the hard cap on live workers.
+**The number of running workers follows the load, not the concurrency limit.**
+About one worker per P (`GOMAXPROCS`) runs tasks while the CPU is the
+bottleneck: once every P is busy, more runnable workers add no throughput, they
+only make every goroutine in the process, the submitters included, wait longer
+for a CPU. When tasks wait behind workers that block (I/O, locks, sleeps), the
+pool adds workers automatically, up to `WithConcurrency`, which is the hard
+cap on live workers, and takes them back once they are no longer needed. A
+pool under a load that keeps it busy is not shrunk back between bursts.
 
 `PushBatch`, `SubmitBatch` and `TrySubmitBatch` enqueue their values as one
 ordered run, claiming consecutive queue slots with a single CAS where they fit.

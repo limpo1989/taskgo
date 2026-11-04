@@ -48,6 +48,18 @@ func backoff(fails *int) {
 	}
 }
 
+// backoffContention is backoff for a producer that reports the contention it
+// met to the queue the ring belongs to (see lfQueue.onContention).
+func (q *lfQueue[T]) backoffContention(fails *int) {
+	if *fails++; *fails >= casRetries {
+		*fails = 0
+		if q.onContention != nil {
+			q.onContention()
+		}
+		runtime.Gosched()
+	}
+}
+
 // lfQueue is an unbounded multi-producer multi-consumer FIFO queue.
 //
 // It is a chain of fixed-size rings. Every enqueued item takes a global
@@ -70,6 +82,10 @@ type lfQueue[T any] struct {
 	// minCapacity is the size of the first ring, and of the ring shrink
 	// swaps in for an emptied one.
 	minCapacity int
+	// onContention, when set, is called by a producer that lost several CAS
+	// races in a row claiming a slot: more than one goroutine is producing,
+	// which a queue sharded over Ps wants to know (see taskQueue.contended).
+	onContention func()
 }
 
 type ring[T any] struct {
@@ -163,7 +179,7 @@ func (q *lfQueue[T]) push(v T) {
 				atomic.StoreUint64(&r.seq[i], t+1)
 				return
 			}
-			backoff(&fails)
+			q.backoffContention(&fails)
 		case int64(s-t) < 0:
 			// The slot still holds ticket t-cap: the ring is full.
 			if atomic.CompareAndSwapUint64(&r.tail, t, t|ringClosed) {
@@ -207,7 +223,7 @@ func (q *lfQueue[T]) pushN(n int, at func(int) T) {
 			continue
 		}
 		if !atomic.CompareAndSwapUint64(&r.tail, t, t+free) {
-			backoff(&fails)
+			q.backoffContention(&fails)
 			continue
 		}
 		for k := uint64(0); k < free; k++ {

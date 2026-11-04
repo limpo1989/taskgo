@@ -44,6 +44,7 @@ type options struct {
 
 	// The following are unexported test hooks.
 	nowFn         func() time.Time // time source, letting tests control janitor decisions
+	monoClock     bool             // nowFn is the default: time idle workers on the runtime clock
 	manualJanitor bool             // when true, no background janitor runs; tests drive cleanExpired
 }
 
@@ -83,6 +84,7 @@ func newOptions(opts []Option) *options {
 	}
 	if o.nowFn == nil {
 		o.nowFn = time.Now
+		o.monoClock = true
 	}
 	return o
 }

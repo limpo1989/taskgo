@@ -239,22 +239,3 @@ func TestStallCompensationShrinksBack(t *testing.T) {
 		t.Fatalf("stop: %v", err)
 	}
 }
-
-// TestLoadProbeFallback covers the lateness heuristic used when the runtime
-// has no runnable-goroutine metric.
-func TestLoadProbeFallback(t *testing.T) {
-	var p loadProbe
-	p.load(0) // resolve metric support
-	if schedMetricsSupported {
-		t.Skip("runtime reports scheduler goroutine metrics; fallback not used")
-	}
-	if got := p.load(0); got != loadIdle {
-		t.Fatalf("no lateness = %v, want idle", got)
-	}
-	if got := p.load(monitorTick / 2); got != loadNormal {
-		t.Fatalf("half-tick lateness = %v, want normal", got)
-	}
-	if got := p.load(3 * monitorTick); got != loadBusy {
-		t.Fatalf("long lateness = %v, want busy", got)
-	}
-}

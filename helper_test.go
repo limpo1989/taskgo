@@ -73,3 +73,9 @@ func fib(n int) int {
 	}
 	return fib(n-1) + fib(n-2)
 }
+
+// cleanExpired runs the janitor's sweep at now, a reading of the clock the
+// test injected with withNowFunc.
+func (q *taskQueue[T]) cleanExpired(now time.Time) bool {
+	return q.cleanExpiredAt(now.UnixNano())
+}
