@@ -674,6 +674,63 @@ func TestTaskKeyedNoKeyAfterStop(t *testing.T) {
 	}
 }
 
+// Stop waits for a keyed submission whose key callback is already in flight.
+// The callback is part of the producer admission window: returning from Stop
+// before it finishes would allow a key to run after the queue was stopped.
+func TestTaskKeyedStopWaitsForKey(t *testing.T) {
+	for _, tc := range []struct {
+		name   string
+		submit func(*Task[uint32])
+	}{
+		{"Push", func(q *Task[uint32]) { q.Push(1) }},
+		{"PushBatch", func(q *Task[uint32]) { q.PushBatch([]uint32{1}) }},
+		{"Submit", func(q *Task[uint32]) { q.Submit(1) }},
+		{"SubmitBatch", func(q *Task[uint32]) { q.SubmitBatch([]uint32{1}) }},
+		{"TrySubmitBatch", func(q *Task[uint32]) { q.TrySubmitBatch([]uint32{1}) }},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			started := make(chan struct{})
+			gate := make(chan struct{})
+			var once sync.Once
+			q := NewTaskKeyed(func(uint32) {}, func(uint32) uint32 {
+				once.Do(func() { close(started) })
+				<-gate
+				return 0
+			}, 4, WithMaxPending(4))
+
+			submitDone := make(chan struct{})
+			go func() {
+				tc.submit(q)
+				close(submitDone)
+			}()
+			<-started
+
+			stopDone := make(chan error, 1)
+			go func() { stopDone <- q.Stop(context.Background()) }()
+			select {
+			case err := <-stopDone:
+				t.Fatalf("Stop returned while key was blocked: %v", err)
+			case <-time.After(100 * time.Millisecond):
+			}
+
+			close(gate)
+			select {
+			case <-submitDone:
+			case <-time.After(time.Second):
+				t.Fatal("submission did not finish after key was released")
+			}
+			select {
+			case err := <-stopDone:
+				if err != nil {
+					t.Fatalf("Stop after key release: %v", err)
+				}
+			case <-time.After(time.Second):
+				t.Fatal("Stop did not finish after key was released")
+			}
+		})
+	}
+}
+
 // occupiedBits returns the shards whose occupied bit is set.
 func (q *taskQueue[T]) occupiedBits() []int {
 	var set []int

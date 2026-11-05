@@ -706,13 +706,13 @@ func (q *taskQueue[T]) push(item taskItem[T]) bool {
 		return false
 	}
 	p := q.place()
-	shard := q.shardAt(item.value, p)
 	if !q.enterAt(p) {
 		return false
 	}
+	defer q.leaveAt(p)
+	shard := q.shardAt(item.value, p)
 	q.pushItem(item, shard)
 	q.dispatch(1)
-	q.leaveAt(p)
 	return true
 }
 
@@ -754,18 +754,18 @@ func (q *taskQueue[T]) pushValues(values []T, submitted bool) int {
 	if q.keyed && q.isStopped() {
 		return 0
 	}
+	p := q.place()
+	if !q.enterAt(p) {
+		return 0
+	}
+	defer q.leaveAt(p)
 	var shards []uint32
 	if q.keyed {
 		var buf [shardBatch]uint32
 		shards = q.shardIndexes(values, &buf)
 	}
-	p := q.place()
-	if !q.enterAt(p) {
-		return 0
-	}
 	q.pushRun(values, shards, submitted, p)
 	q.dispatch(len(values))
-	q.leaveAt(p)
 	return len(values)
 }
 
@@ -779,17 +779,16 @@ func (q *taskQueue[T]) submit(value T) bool {
 		return false
 	}
 	p := q.place()
+	if !q.enterAt(p) {
+		return false
+	}
+	defer q.leaveAt(p)
 	shard := q.shardAt(value, p)
 	if q.reservePending(1, true) == 0 {
 		return false
 	}
-	if !q.enterAt(p) {
-		atomic.AddInt64(&q.pending, -1)
-		return false
-	}
 	q.pushItem(taskItem[T]{value: value, submitted: true}, shard)
 	q.dispatch(1)
-	q.leaveAt(p)
 	return true
 }
 
@@ -802,8 +801,14 @@ func (q *taskQueue[T]) submitBatch(values []T, atomicBatch bool) (accepted int, 
 	}
 	accepted = len(values)
 	submitted := q.opt.maxPending > 0
+	p := q.place()
+	if !q.enterAt(p) {
+		return 0, false
+	}
+	defer q.leaveAt(p)
 	// The key runs before the reservation below, so a key that panics leaves
-	// nothing admitted, the whole batch included.
+	// nothing admitted, the whole batch included. The producer admission is
+	// registered first so Stop waits for a key callback already in flight.
 	var shards []uint32
 	if q.keyed {
 		var buf [shardBatch]uint32
@@ -814,16 +819,8 @@ func (q *taskQueue[T]) submitBatch(values []T, atomicBatch bool) (accepted int, 
 			return 0, false
 		}
 	}
-	p := q.place()
-	if !q.enterAt(p) {
-		if submitted {
-			atomic.AddInt64(&q.pending, -int64(accepted))
-		}
-		return 0, false
-	}
 	q.pushRun(values[:accepted], shards, submitted, p)
 	q.dispatch(accepted)
-	q.leaveAt(p)
 	return accepted, accepted == len(values)
 }
 

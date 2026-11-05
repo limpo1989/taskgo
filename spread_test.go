@@ -41,19 +41,32 @@ func TestUnkeyedSpreadDrainsSingleQueue(t *testing.T) {
 	}
 	block := make(chan struct{})
 	var burst sync.WaitGroup
-	// Hold every running worker in a task, so the submissions below all wait.
-	for i := 0; i < int(atomic.LoadInt64(&tq.target)); i++ {
+	// Hold every target worker in a task, so the submissions below all wait.
+	// Freeze the monitor while setting up the transition: otherwise the monitor
+	// may grow the target while the blockers are starting and consume the old
+	// FIFO before the spread is enabled.
+	atomic.StoreUint32(&tq.monitorOn, 1)
+	blockers := int(atomic.LoadInt64(&tq.target))
+	var started atomic.Int32
+	for i := 0; i < blockers; i++ {
 		burst.Add(1)
-		q.Push(func() { <-block; burst.Done() })
+		q.Push(func() {
+			started.Add(1)
+			<-block
+			burst.Done()
+		})
 	}
-	waitFor(t, time.Second, func() bool { return int(atomic.LoadInt64(&tq.running)) >= 1 })
+	waitFor(t, time.Second, func() bool { return int(started.Load()) == blockers })
 	// A burst lands in the single FIFO while the producers have not spread.
 	const leftovers = 200
+	before := q.queue.enqueued()
 	for i := 0; i < leftovers; i++ {
 		burst.Add(1)
 		q.Push(func() { burst.Done() })
 	}
-	waitFor(t, time.Second, func() bool { return q.queue.len() == leftovers })
+	if got := q.queue.enqueued() - before; got != leftovers {
+		t.Fatalf("single FIFO accepted %d leftovers, want %d", got, leftovers)
+	}
 	// The producers contend; from here on every task lands on a shard, and a
 	// steady stream keeps the shards from ever running dry. The stream is
 	// counted apart, so waiting on the burst is not racing its Add calls.
